@@ -108,67 +108,248 @@ res.status(200).json({ message: 'Order created successfully', data: newOrder._id
   }
 };
 
+// exports.updateOrder = async (req, res) => {
+//   try {
+//     const { _id, user, ...updateData } = req.body;
+//     if (!_id) return res.status(400).json({ message: "ID is required" });
+
+//     const existingOrder = await Order.findById(_id);
+//     if (!existingOrder) {
+//       return res.status(404).json({ message: "Order not found" });
+//     }
+
+//     // --- 1. PREPARE CHANGE TRACKING FOR LOG ---
+//     let changes = [];
+//     if (updateData.status && updateData.status !== existingOrder.status) {
+//       changes.push(`Status changed from "${existingOrder.status}" to "${updateData.status}"`);
+//     }
+//     if (updateData.orderDate && updateData.orderDate !== existingOrder.orderDate) {
+//       changes.push(`Order Date updated`);
+//     }
+
+//     // --- 2. VALIDATE & PREPARE PRODUCT DETAILS ---
+//     if (updateData.productDetails) {
+//       for (const detail of updateData.productDetails) {
+//         const nonNullProductIds = [
+//           detail.childProductId,
+//           detail.parentProductId,
+//           detail.mainParentId,
+//         ].filter(Boolean);
+
+//         if (nonNullProductIds.length !== 1) {
+//           return res.status(400).json({
+//             message: "Exactly one product ID must be provided per product detail",
+//           });
+//         }
+//       }
+
+//       // Map details and build product change description
+//       let productSummary = [];
+//       for (const detail of updateData.productDetails) {
+//         let name = "Unknown Product";
+//         if (detail.parentProductId) {
+//           const p = await ParentProduct.findById(detail.parentProductId);
+//           name = p ? p.parentProductName : name;
+//         } else if (detail.mainParentId) {
+//           const mp = await MainParentProduct.findById(detail.mainParentId);
+//           name = mp ? mp.mainParentProductName : name;
+//         }
+//         productSummary.push(`${name} (Req: ${detail.requiredQuantity}, Asgn: ${detail.assignedQuantity || 0})`);
+//       }
+//       changes.push(`Products updated: [${productSummary.join(', ')}]`);
+
+//       updateData.productDetails = updateData.productDetails.map((detail) => ({
+//         productTypeId: detail.productTypeId,
+//         childProductId: detail.childProductId || null,
+//         parentProductId: detail.parentProductId || null,
+//         mainParentId: detail.mainParentId || null,
+//         requiredQuantity: detail.requiredQuantity,
+//         assignedQuantity: detail.assignedQuantity || 0,
+//       }));
+//     }
+
+//     // --- 3. MICRO-ORDER LOGIC ---
+//     if (
+//       updateData.status &&
+//       updateData.status.toLowerCase() === "order executed" &&
+//       existingOrder.status.toLowerCase() !== "order executed"
+//     ) {
+//       const unassignedItems = [];
+//       const remainingItems = [];
+//       const updatedProductDetails = updateData.productDetails || existingOrder.productDetails;
+
+//       for (const detail of updatedProductDetails) {
+//         const assignedQty = detail.assignedQuantity || 0;
+//         const requiredQty = detail.requiredQuantity || 0;
+
+//         if (assignedQty < requiredQty) {
+//           unassignedItems.push({
+//             ...detail,
+//             requiredQuantity: requiredQty - assignedQty,
+//             assignedQuantity: 0,
+//           });
+//           if (assignedQty > 0) {
+//             remainingItems.push({ ...detail, requiredQuantity: detail.requiredQuantity, assignedQuantity: assignedQty });
+//           }
+//         } else {
+//           remainingItems.push({ ...detail, requiredQuantity: detail.requiredQuantity, assignedQuantity: assignedQty });
+//         }
+//       }
+
+//       updateData.productDetails = remainingItems;
+
+//       if (unassignedItems.length > 0) {
+//         const baseCode = existingOrder.orderCode.split("_")[0];
+//         let suffixChar = "A";
+//         let newOrderCode = `${baseCode}_${suffixChar}`;
+
+//         while (await Order.findOne({ orderCode: newOrderCode })) {
+//           suffixChar = String.fromCharCode(suffixChar.charCodeAt(0) + 1);
+//           newOrderCode = `${baseCode}_${suffixChar}`;
+//         }
+
+//         const microOrder = new Order({
+//           ...existingOrder.toObject(),
+//           _id: undefined,
+//           orderCode: newOrderCode,
+//           productDetails: unassignedItems,
+//           status: "Order Pending",
+//           orderType: "MicroOrder",
+//           parentOrderId: existingOrder._id,
+//           createdAt: new Date(),
+//           updatedAt: new Date(),
+//         });
+
+//         await microOrder.save();
+
+//         // Log Micro Order
+//         await ActivityLog.logCreate({
+//           employeeId: user?.employeeId,
+//           employeeName: user?.employeeName,
+//           unitId: microOrder.unitId,
+//           orderId: microOrder._id,
+//           orderCode: microOrder.orderCode,
+//           action: "Order created",
+//           module: "Order",
+//           description: `Micro Order ${microOrder.orderCode} automatically branched from ${existingOrder.orderCode} due to partial assignment.`,
+//           ipAddress: req.ip,
+//           userAgent: req.headers["user-agent"],
+//         });
+//       }
+//     }
+
+//     // --- 4. EXECUTE UPDATE & LOG ORIGINAL ---
+//     const updated = await Order.findByIdAndUpdate(_id, updateData, {
+//       new: true,
+//       runValidators: true,
+//     });
+
+//     if (!updated) return res.status(404).json({ message: "Order not found after update" });
+
+//     // Build the final detailed description
+//     const detailedDescription = `Order ${updated.orderCode} updated by ${user?.employeeName || 'System'}. Changes: ${changes.join(' | ')}`;
+
+//     await ActivityLog.logCreate({
+//       employeeId: user?.employeeId,
+//       employeeCode: user?.employeeCode,
+//       employeeName: user?.employeeName,
+//       departmentId: user?.departmentId,
+//       role: user?.role,
+//       unitId: updated.unitId,
+//       customerID: updated.customerId,
+//       orderId: updated._id,
+//       orderCode: updated.orderCode,
+//       orderType: updated.orderType,
+//       orderStatus: updated.status,
+//       action: "Order Updated",
+//       module: "Order",
+//       entityName: updated.orderCode,
+//       entityCode: updated.orderCode,
+//       oldValue: JSON.stringify(existingOrder.status), // Storing old status as reference
+//       newValue: JSON.stringify(updated.status),
+//       description: detailedDescription,
+//       ipAddress: req.ip,
+//       userAgent: req.headers["user-agent"],
+//     });
+
+//     res.status(200).json({
+//       message: "Order updated successfully",
+//       data: updated,
+//     });
+//   } catch (error) {
+//     console.error(error);
+//     res.status(500).json({ message: error.message });
+//   }
+// };
+
 exports.updateOrder = async (req, res) => {
   try {
     const { _id, user, ...updateData } = req.body;
     if (!_id) return res.status(400).json({ message: "ID is required" });
 
+    // 1. Fetch the existing order (The Source of Truth)
     const existingOrder = await Order.findById(_id);
     if (!existingOrder) {
       return res.status(404).json({ message: "Order not found" });
     }
 
-    // --- 1. PREPARE CHANGE TRACKING FOR LOG ---
     let changes = [];
     if (updateData.status && updateData.status !== existingOrder.status) {
       changes.push(`Status changed from "${existingOrder.status}" to "${updateData.status}"`);
     }
-    if (updateData.orderDate && updateData.orderDate !== existingOrder.orderDate) {
-      changes.push(`Order Date updated`);
-    }
 
-    // --- 2. VALIDATE & PREPARE PRODUCT DETAILS ---
+    // 2. Process Product Details - STRICTLY PRESERVING ASSIGNED QUANTITIES
     if (updateData.productDetails) {
-      for (const detail of updateData.productDetails) {
-        const nonNullProductIds = [
-          detail.childProductId,
-          detail.parentProductId,
-          detail.mainParentId,
+      const processedDetails = [];
+
+      for (const incomingDetail of updateData.productDetails) {
+        // ID Validation
+        const productIds = [
+          incomingDetail.childProductId,
+          incomingDetail.parentProductId,
+          incomingDetail.mainParentId,
         ].filter(Boolean);
 
-        if (nonNullProductIds.length !== 1) {
+        if (productIds.length !== 1) {
           return res.status(400).json({
             message: "Exactly one product ID must be provided per product detail",
           });
         }
-      }
 
-      // Map details and build product change description
-      let productSummary = [];
-      for (const detail of updateData.productDetails) {
-        let name = "Unknown Product";
-        if (detail.parentProductId) {
-          const p = await ParentProduct.findById(detail.parentProductId);
-          name = p ? p.parentProductName : name;
-        } else if (detail.mainParentId) {
-          const mp = await MainParentProduct.findById(detail.mainParentId);
-          name = mp ? mp.mainParentProductName : name;
+        // Find matching product in DB to get its current assignedQuantity
+        const matchingExisting = existingOrder.productDetails.find((ed) => {
+          return (
+            (incomingDetail.childProductId && ed.childProductId?.toString() === incomingDetail.childProductId.toString()) ||
+            (incomingDetail.parentProductId && ed.parentProductId?.toString() === incomingDetail.parentProductId.toString()) ||
+            (incomingDetail.mainParentId && ed.mainParentId?.toString() === incomingDetail.mainParentId.toString())
+          );
+        });
+
+        // Use existing assigned quantity; default to 0 only if it's a brand new product
+        const preservedAssignedQty = matchingExisting ? matchingExisting.assignedQuantity : 0;
+
+        // Safety: Prevent setting Required Quantity lower than what is already assigned
+        if (incomingDetail.requiredQuantity < preservedAssignedQty) {
+          return res.status(400).json({
+            message: `Required quantity cannot be less than assigned quantity (${preservedAssignedQty}) for product.`,
+          });
         }
-        productSummary.push(`${name} (Req: ${detail.requiredQuantity}, Asgn: ${detail.assignedQuantity || 0})`);
-      }
-      changes.push(`Products updated: [${productSummary.join(', ')}]`);
 
-      updateData.productDetails = updateData.productDetails.map((detail) => ({
-        productTypeId: detail.productTypeId,
-        childProductId: detail.childProductId || null,
-        parentProductId: detail.parentProductId || null,
-        mainParentId: detail.mainParentId || null,
-        requiredQuantity: detail.requiredQuantity,
-        assignedQuantity: detail.assignedQuantity || 0,
-      }));
+        processedDetails.push({
+          productTypeId: incomingDetail.productTypeId,
+          childProductId: incomingDetail.childProductId || null,
+          parentProductId: incomingDetail.parentProductId || null,
+          mainParentId: incomingDetail.mainParentId || null,
+          requiredQuantity: incomingDetail.requiredQuantity,
+          assignedQuantity: preservedAssignedQty, // IGNORE req.body value
+        });
+      }
+
+      updateData.productDetails = processedDetails;
+      changes.push(`Product quantities updated (Assigned quantities preserved)`);
     }
 
-    // --- 3. MICRO-ORDER LOGIC ---
+    // 3. Micro-Order Logic (On Execution)
     if (
       updateData.status &&
       updateData.status.toLowerCase() === "order executed" &&
@@ -176,23 +357,27 @@ exports.updateOrder = async (req, res) => {
     ) {
       const unassignedItems = [];
       const remainingItems = [];
-      const updatedProductDetails = updateData.productDetails || existingOrder.productDetails;
+      // Use the newly prepared updateData or fall back to existing
+      const itemsToProcess = updateData.productDetails || existingOrder.productDetails;
 
-      for (const detail of updatedProductDetails) {
+      for (const detail of itemsToProcess) {
         const assignedQty = detail.assignedQuantity || 0;
         const requiredQty = detail.requiredQuantity || 0;
 
         if (assignedQty < requiredQty) {
+          // New order gets the remainder
           unassignedItems.push({
             ...detail,
             requiredQuantity: requiredQty - assignedQty,
             assignedQuantity: 0,
           });
-          if (assignedQty > 0) {
-            remainingItems.push({ ...detail, requiredQuantity: detail.requiredQuantity, assignedQuantity: assignedQty });
-          }
+          // Original order "shrinks" its requirement to match what was shipped
+          remainingItems.push({ 
+            ...detail, 
+            requiredQuantity: assignedQty 
+          });
         } else {
-          remainingItems.push({ ...detail, requiredQuantity: detail.requiredQuantity, assignedQuantity: assignedQty });
+          remainingItems.push({ ...detail });
         }
       }
 
@@ -222,7 +407,6 @@ exports.updateOrder = async (req, res) => {
 
         await microOrder.save();
 
-        // Log Micro Order
         await ActivityLog.logCreate({
           employeeId: user?.employeeId,
           employeeName: user?.employeeName,
@@ -231,14 +415,14 @@ exports.updateOrder = async (req, res) => {
           orderCode: microOrder.orderCode,
           action: "Order created",
           module: "Order",
-          description: `Micro Order ${microOrder.orderCode} automatically branched from ${existingOrder.orderCode} due to partial assignment.`,
+          description: `Micro Order ${microOrder.orderCode} branched from ${existingOrder.orderCode}.`,
           ipAddress: req.ip,
           userAgent: req.headers["user-agent"],
         });
       }
     }
 
-    // --- 4. EXECUTE UPDATE & LOG ORIGINAL ---
+    // 4. Final Database Execution
     const updated = await Order.findByIdAndUpdate(_id, updateData, {
       new: true,
       runValidators: true,
@@ -246,28 +430,19 @@ exports.updateOrder = async (req, res) => {
 
     if (!updated) return res.status(404).json({ message: "Order not found after update" });
 
-    // Build the final detailed description
-    const detailedDescription = `Order ${updated.orderCode} updated by ${user?.employeeName || 'System'}. Changes: ${changes.join(' | ')}`;
-
+    // 5. Log the Update
     await ActivityLog.logCreate({
       employeeId: user?.employeeId,
       employeeCode: user?.employeeCode,
       employeeName: user?.employeeName,
-      departmentId: user?.departmentId,
-      role: user?.role,
       unitId: updated.unitId,
-      customerID: updated.customerId,
       orderId: updated._id,
       orderCode: updated.orderCode,
-      orderType: updated.orderType,
-      orderStatus: updated.status,
       action: "Order Updated",
       module: "Order",
-      entityName: updated.orderCode,
-      entityCode: updated.orderCode,
-      oldValue: JSON.stringify(existingOrder.status), // Storing old status as reference
+      oldValue: JSON.stringify(existingOrder.status),
       newValue: JSON.stringify(updated.status),
-      description: detailedDescription,
+      description: `Order ${updated.orderCode} updated. Changes: ${changes.join(' | ')}`,
       ipAddress: req.ip,
       userAgent: req.headers["user-agent"],
     });
@@ -276,8 +451,9 @@ exports.updateOrder = async (req, res) => {
       message: "Order updated successfully",
       data: updated,
     });
+
   } catch (error) {
-    console.error(error);
+    console.error("Update Error:", error);
     res.status(500).json({ message: error.message });
   }
 };
