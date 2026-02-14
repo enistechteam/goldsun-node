@@ -467,12 +467,10 @@ exports.updateOrder = async (req, res) => {
 
 exports.bulkExecuteOrders = async (req, res) => {
   try {
-    const { orderIds,user } = req.body;
+    const { orderIds, user } = req.body;
 
     if (!Array.isArray(orderIds) || orderIds.length === 0) {
-      return res.status(400).json({
-        message: "orderIds array is required.",
-      });
+      return res.status(400).json({ message: "orderIds array is required." });
     }
 
     let successCount = 0;
@@ -482,58 +480,53 @@ exports.bulkExecuteOrders = async (req, res) => {
       try {
         const existingOrder = await Order.findById(orderId);
         if (!existingOrder) {
-          failures.push({
-            orderId,
-            reason: "Order not found",
-          });
+          failures.push({ orderId, reason: "Order not found" });
           continue;
         }
 
-        // skip already executed
         if (existingOrder.status.toLowerCase() === "order executed") {
-          failures.push({
-            orderId,
-            reason: "Already executed",
-          });
+          failures.push({ orderId, reason: "Already executed" });
           continue;
         }
 
         let updateData = {};
-
-        // Prepare productDetails for splitting
         const productDetails = existingOrder.productDetails || [];
-
         const unassignedItems = [];
         const remainingItems = [];
 
         for (const detail of productDetails) {
-          const assignedQty = detail.assignedQuantity || 0;
-          const requiredQty = detail.requiredQuantity || 0;
+          // FIX 1: Force numeric conversion and handle precision issues
+          const assignedQty = Number(detail.assignedQuantity) || 0;
+          const requiredQty = Number(detail.requiredQuantity) || 0;
+          const diff = requiredQty - assignedQty;
 
-          if (assignedQty < requiredQty) {
+          // FIX 2: Only create unassigned entries if the difference is meaningfully greater than zero
+          // Using 0.0001 to handle potential floating point math errors
+          if (diff > 0.0001) {
             unassignedItems.push({
               ...detail,
-              requiredQuantity: requiredQty - assignedQty,
+              requiredQuantity: diff,
               assignedQuantity: 0,
             });
 
+            // If we have partial assignment, original order keeps the assigned part
             if (assignedQty > 0) {
               remainingItems.push({
                 ...detail,
-                requiredQuantity: detail.requiredQuantity,
+                requiredQuantity: assignedQty, // Shrink required to match assigned
                 assignedQuantity: assignedQty,
               });
             }
           } else {
+            // Case where assigned >= required: Fully fulfilled
             remainingItems.push({
               ...detail,
-              requiredQuantity: detail.requiredQuantity,
+              requiredQuantity: requiredQty,
               assignedQuantity: assignedQty,
             });
           }
         }
 
-        // Update the original order
         updateData.status = "Order Executed";
         updateData.productDetails = remainingItems;
 
@@ -544,26 +537,20 @@ exports.bulkExecuteOrders = async (req, res) => {
         );
 
         if (!updatedOrder) {
-          failures.push({
-            orderId,
-            reason: "Order not found after update",
-          });
+          failures.push({ orderId, reason: "Order not found after update" });
           continue;
         }
 
-        // Create micro-order if needed
+        // FIX 3: Micro-order is ONLY created if there are items with quantity > 0
         if (unassignedItems.length > 0) {
-          // Extract base code by splitting at '_', to handle nested _A_A_A issues
-const baseCode = existingOrder.orderCode.split("_")[0];
-let suffixChar = "A";
-let newOrderCode = `${baseCode}_${suffixChar}`;
+          const baseCode = existingOrder.orderCode.split("_")[0];
+          let suffixChar = "A";
+          let newOrderCode = `${baseCode}_${suffixChar}`;
 
-// Loop until we find a unique code
-while (await Order.findOne({ orderCode: newOrderCode })) {
-  suffixChar = String.fromCharCode(suffixChar.charCodeAt(0) + 1);
-  newOrderCode = `${baseCode}_${suffixChar}`;
-}
-
+          while (await Order.findOne({ orderCode: newOrderCode })) {
+            suffixChar = String.fromCharCode(suffixChar.charCodeAt(0) + 1);
+            newOrderCode = `${baseCode}_${suffixChar}`;
+          }
 
           const microOrder = new Order({
             ...existingOrder.toObject(),
@@ -573,15 +560,14 @@ while (await Order.findOne({ orderCode: newOrderCode })) {
             status: "Order Pending",
             orderType: "MicroOrder",
             parentOrderId: existingOrder._id,
-            orderDate:existingOrder.orderDate,
-            orderConfirmDate:null,
+            orderDate: existingOrder.orderDate,
+            orderConfirmDate: null,
             createdAt: new Date(),
             updatedAt: new Date(),
           });
 
           await microOrder.save();
 
-          // Log micro-order creation
           await ActivityLog.logCreate({
             employeeId: user?.employeeId,
             employeeCode: user?.employeeCode,
@@ -592,9 +578,6 @@ while (await Order.findOne({ orderCode: newOrderCode })) {
             unitId: microOrder.unitId,
             customerID: microOrder.customerId,
             unitName: user.unitName,
-            childProductId: null,
-            parentProductId: null,
-            mainParentId: null,
             orderId: microOrder._id,
             orderCode: microOrder.orderCode,
             orderType: microOrder.orderType,
@@ -603,9 +586,6 @@ while (await Order.findOne({ orderCode: newOrderCode })) {
             module: "Order",
             entityName: microOrder.orderCode,
             entityCode: microOrder.orderCode,
-            changeField: null,
-            oldValue: null,
-            activityValue: null,
             description: `Micro Order created with code ${microOrder.orderCode}`,
             ipAddress: req.ip,
             userAgent: req.headers["user-agent"],
@@ -617,31 +597,22 @@ while (await Order.findOne({ orderCode: newOrderCode })) {
           employeeId: user?.employeeId,
           employeeCode: user?.employeeCode,
           employeeName: user?.employeeName,
-          departmentId: user?.departmentId,
-          departmentName: user?.departmentName,
-          role: user?.role,
           unitId: updatedOrder.unitId,
           customerID: updatedOrder.customerId,
-          unitName: user.unitName,
-          childProductId: null,
-          parentProductId: null,
-          mainParentId: null,
           orderId: updatedOrder._id,
           orderCode: updatedOrder.orderCode,
           orderType: updatedOrder.orderType,
           orderStatus: updatedOrder.status,
-          action: updatedOrder.status,
+          action: "Order Executed",
           module: "Order",
           entityName: updatedOrder.orderCode,
           entityCode: updatedOrder.orderCode,
-          changeField: null,
-          description: `Order updated with code ${updatedOrder.orderCode}`,
+          description: `Order ${updatedOrder.orderCode} successfully executed.`,
           ipAddress: req.ip,
           userAgent: req.headers["user-agent"],
         });
 
         successCount++;
-
       } catch (innerErr) {
         console.error(`Error processing order ${orderId}`, innerErr);
         failures.push({
@@ -656,12 +627,9 @@ while (await Order.findOne({ orderCode: newOrderCode })) {
       successCount,
       failed: failures,
     });
-
   } catch (error) {
     console.error(error);
-    res.status(500).json({
-      message: error.message,
-    });
+    res.status(500).json({ message: error.message });
   }
 };
 
