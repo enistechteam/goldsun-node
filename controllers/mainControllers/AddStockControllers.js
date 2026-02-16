@@ -433,17 +433,17 @@ exports.addStockToMainParentProduct = async (req, res) => {
     const unitObjectId = new mongoose.Types.ObjectId(unitId);
 
     // 1. ATOMIC UPDATE & FETCH (Main Parent)
-    // We use findOneAndUpdate to get the old stock for logging while updating
-    const mainParent = await MainParent.findOneAndUpdate(
+    // We use findOneAndUpdate with new: false to get the EXACT state before the addition
+    const mainParentBefore = await MainParent.findOneAndUpdate(
       { _id: productid, "stockByUnit.unitId": unitObjectId },
       { $inc: { "stockByUnit.$.totalMPQuantity": quantity, "stockByUnit.$.availableToCommitMPQuantity": quantity } },
-      { session, new: false } // Returns state BEFORE update
+      { session, new: false } 
     );
 
     let oldTotal = 0;
 
-    if (!mainParent) {
-      // Unit doesn't exist yet, push it safely
+    if (!mainParentBefore) {
+      // If the unit entry didn't exist, we push a new one.
       const freshMain = await MainParent.findByIdAndUpdate(
         productid,
         { 
@@ -457,27 +457,29 @@ exports.addStockToMainParentProduct = async (req, res) => {
         { session, new: true }
       );
       if (!freshMain) throw new Error('Main Parent Product not found');
+      oldTotal = 0; // It's a new unit entry
     } else {
-      const stockEntry = mainParent.stockByUnit.find(s => s.unitId.toString() === unitId);
+      // Find the old total from the snapshot we just took
+      const stockEntry = mainParentBefore.stockByUnit.find(s => s.unitId.toString() === unitId);
       oldTotal = stockEntry?.totalMPQuantity || 0;
     }
 
-    // Refresh data for constituent loop
-    const activeMainParent = await MainParent.findById(productid).session(session);
+    // Refresh data for constituent loop (to get parentProducts mapping)
+    const activeMainParent = await MainParent.findById(productid).session(session).lean();
 
     // 2. CONSTITUENT UPDATES (Parents & Children)
     for (const pp of activeMainParent.parentProducts) {
       const requiredPPQty = pp.quantity * quantity;
 
-      // Update Parent Product
+      // Atomic Update Parent Product
       const updatedPP = await ParentProduct.findOneAndUpdate(
         { _id: pp.parentProductId, "stockByUnit.unitId": unitObjectId },
         { $inc: { "stockByUnit.$.totalPPQuantity": requiredPPQty, "stockByUnit.$.availableToCommitPPQuantity": requiredPPQty } },
         { session, new: true }
       );
 
-      // If unit didn't exist in Parent, push it
       if (!updatedPP) {
+        // Handle missing unit entry in Parent Product
         await ParentProduct.updateOne(
           { _id: pp.parentProductId },
           { 
@@ -492,11 +494,11 @@ exports.addStockToMainParentProduct = async (req, res) => {
         );
       }
 
-      // Re-fetch parent to get child config (to ensure we have latest child mappings)
+      // Re-fetch parent configuration for children
       const parentDoc = await ParentProduct.findById(pp.parentProductId).session(session).lean();
       
-      // Update Child Products
-      for (const cp of parentDoc.childProducts) {
+      // Atomic Update Child Products
+      for (const cp of parentDoc.childProducts || []) {
         const requiredChildQty = requiredPPQty * cp.quantity;
         const cpUpdate = await ChildProduct.updateOne(
           { _id: cp.childProductId, "stockByUnit.unitId": unitObjectId },
@@ -520,11 +522,14 @@ exports.addStockToMainParentProduct = async (req, res) => {
         }
       }
 
-      // 3. RECALCULATE IMPACTED MAIN PARENTS
+      // 3. RECALCULATE IMPACTED MAIN PARENTS (Using atomic recalculation logic)
       await recalculateMainParentsForParent(pp.parentProductId, unitId, session);
     }
 
-    // 4. LOGGING & COMMIT
+    // 4. LOGGING (Preserving your exact logic)
+    // newValue is calculated as oldTotal + added quantity
+    const newTotal = oldTotal + quantity;
+
     await logCountChange.logCountChange({
       req,
       entityName: activeMainParent.mainParentProductName,
@@ -532,9 +537,9 @@ exports.addStockToMainParentProduct = async (req, res) => {
       module: "MainParentProduct",
       changeField: "totalMPQuantity",
       oldValue: oldTotal,
-      newValue: oldTotal + quantity,
+      newValue: newTotal,
       activityValue: quantity,
-      description: `Stock Added: ${oldTotal} -> ${oldTotal + quantity}`,
+      description: `Added ${quantity} Quantities of ${activeMainParent.mainParentProductName} in Unit, Old Stock - ${oldTotal}, Current Stock - ${newTotal}`,
       mainParentId: activeMainParent._id,
       unitId: unitId
     });
@@ -543,7 +548,7 @@ exports.addStockToMainParentProduct = async (req, res) => {
     res.status(200).json({ message: 'Stock added successfully.' });
 
   } catch (err) {
-    await session.abortTransaction();
+    if (session.inTransaction()) await session.abortTransaction();
     console.error("🔥 TRANSACTION ABORTED:", err);
     res.status(500).json({ message: err.message });
   } finally {
