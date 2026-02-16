@@ -54,414 +54,214 @@ exports.addStockToChildProduct = async (req, res) => {
 };
 
 exports.addStockToParentProduct = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
   try {
     const { productid, quantity, unitId } = req.body;
+    const unitObjectId = new mongoose.Types.ObjectId(unitId);
 
-    // 🟠 Find the ParentProduct
-    const unitDet= await Unit.findById({_id:new mongoose.Types.ObjectId(unitId)})
-    const parent = await ParentProduct.findById(productid);
+    // 1. ATOMIC UPDATE (Find and Update in one go)
+    const parent = await ParentProduct.findOneAndUpdate(
+      { _id: productid, "stockByUnit.unitId": unitObjectId },
+      { $inc: { "stockByUnit.$.totalPPQuantity": quantity, "stockByUnit.$.availableToCommitPPQuantity": quantity } },
+      { session, new: false } // Get state BEFORE update for accurate logging
+    );
+
+    let oldTotal = 0;
     if (!parent) {
-      return res.status(404).json({ message: 'Parent product not found' });
-    }
-
-    // ✅ Find previous total quantity for logging
-    let stockEntry = parent.stockByUnit.find(
-      (s) => s.unitId.toString() === unitId
-    );
-
-    const oldTotal = stockEntry?.totalPPQuantity || 0;
-
-    // ✅ Update or create the stock entry for this unit
-    if (!stockEntry) {
-      parent.stockByUnit.push({
-        unitId,
-        totalPPQuantity: quantity,
-        committedPPQuantity: 0,
-        availableToCommitPPQuantity: quantity
-      });
+      // Unit doesn't exist, push new unit entry safely
+      const freshParent = await ParentProduct.findByIdAndUpdate(
+        productid,
+        { $push: { stockByUnit: { unitId: unitObjectId, totalPPQuantity: quantity, committedPPQuantity: 0, availableToCommitPPQuantity: quantity } } },
+        { session, new: true }
+      );
+      if (!freshParent) throw new Error('Parent product not found');
     } else {
-      stockEntry.totalPPQuantity += quantity;
-      stockEntry.availableToCommitPPQuantity += quantity;
+      oldTotal = parent.stockByUnit.find(s => s.unitId.toString() === unitId)?.totalPPQuantity || 0;
     }
 
-    await parent.save();
+    // 2. RECALCULATE (Pass session!)
+    await recalculateMainParentsForParent(productid, unitId, session);
 
-    // ✅ Find MainParents that reference this ParentProduct
-    const mainParents = await MainParent.find({
-      "parentProducts.parentProductId": productid
-    });
-
-    for (const mp of mainParents) {
-      const requiredParents = mp.parentProducts;
-
-      let minPossibleUnits = Infinity;
-
-      for (const config of requiredParents) {
-        const ppId = config.parentProductId;
-        const qtyNeeded = config.quantity;
-
-        const pp = await ParentProduct.findById(ppId);
-        if (!pp) {
-          minPossibleUnits = 0;
-          break;
-        }
-
-        const stockByUnit = pp.stockByUnit.find(s =>
-          s.unitId?.toString() === unitId
-        );
-
-        const available = stockByUnit?.availableToCommitPPQuantity || 0;
-
-        if (qtyNeeded <= 0) {
-          minPossibleUnits = 0;
-          break;
-        }
-
-        const possibleUnits = Math.floor(available / qtyNeeded);
-
-        minPossibleUnits = Math.min(minPossibleUnits, possibleUnits);
-      }
-
-      if (minPossibleUnits > 0 && minPossibleUnits !== Infinity) {
-        // Find existing MP stock or create it
-        let mpStock = mp.stockByUnit?.find(
-          s => s.unitId?.toString() === unitId
-        );
-
-        if (!mpStock) {
-          if (!mp.stockByUnit) mp.stockByUnit = [];
-          mp.stockByUnit.push({
-            unitId,
-            totalMPQuantity: minPossibleUnits,
-            availableToCommitMPQuantity: minPossibleUnits
-          });
-        } else {
-          mpStock.totalMPQuantity = minPossibleUnits;
-          mpStock.availableToCommitMPQuantity = minPossibleUnits;
-        }
-
-        await mp.save();
-      }
-    }
-
-    const updatedEntry = parent.stockByUnit.find(
-      (s) => s.unitId.toString() === unitId
-    );
-
-    // ✅ Log the stock addition
+    // 3. LOGGING
+    const unitDet = await Unit.findById(unitObjectId).session(session);
     await logCountChange.logCountChange({
       req,
-      entityName: parent.parentProductName,
-      entityCode: parent.parentProductCode,
-      module: "ParentProduct",
-      changeField: "totalPPQuantity",
+      entityName: parent?.parentProductName || "Parent Product",
       oldValue: oldTotal,
-      newValue: updatedEntry.totalPPQuantity,
-      activityValue:quantity,
-      description: `Added ${quantity} Quantities of ${parent.parentProductName} in ${unitDet.UnitName}, Old Stock - ${oldTotal} , Current Stock - ${updatedEntry.totalPPQuantity} `,
-      parentProductId: parent._id,
+      newValue: oldTotal + quantity,
+      activityValue: quantity,
+      description: `Added ${quantity} to ${unitDet?.UnitName}. Stock: ${oldTotal} -> ${oldTotal + quantity}`,
+      parentProductId: productid,
       unitId: unitId
     });
 
-    res.status(200).json({
-      message: "Stock added to parent product and MainParents recalculated.",
-      data: {
-        productid: parent._id,
-        unitId: updatedEntry.unitId,
-        totalPPQuantity: updatedEntry.totalPPQuantity,
-        committedPPQuantity: updatedEntry.committedPPQuantity,
-        availableToCommitPPQuantity: updatedEntry.availableToCommitPPQuantity
-      }
-    });
+    await session.commitTransaction();
+    res.status(200).json({ message: "Stock added and recalculated." });
   } catch (err) {
-    console.error("🔥 ERROR:", err);
-    res.status(500).json({ message: err.message || "Internal server error." });
+    await session.abortTransaction();
+    res.status(500).json({ message: err.message });
+  } finally {
+    session.endSession();
   }
 };
 
 exports.bulkAddStockToParentProducts = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
     const { stocks } = req.body; // [{ parentProductName, quantity, unitId }]
 
     if (!Array.isArray(stocks) || stocks.length === 0) {
-      return res.status(400).json({ message: 'Stocks array is required and must not be empty' });
+      throw new Error('Stocks array is required and must not be empty');
     }
 
-    const results = [];
+    const parentNames = stocks.map(s => s.parentProductName);
+    const products = await ParentProduct.find({ parentProductName: { $in: parentNames } }).session(session);
+    const productMap = new Map(products.map(p => [p.parentProductName, p]));
+
+    const bulkOps = [];
+    const logsToCreate = [];
+    const affectedProductIds = new Set();
 
     for (const stock of stocks) {
       const { parentProductName, quantity, unitId } = stock;
+      const product = productMap.get(parentProductName);
 
-      const product = await ParentProduct.findOne({ parentProductName });
+      if (!product) continue;
 
-      if (!product) {
-        results.push({
-          parentProductName,
-          status: 'failed',
-          reason: 'Parent product not found'
-        });
-        continue;
-      }
+      const unitObjectId = new mongoose.Types.ObjectId(unitId);
+      const stockEntry = product.stockByUnit.find(s => s.unitId.toString() === unitId);
+      const oldTotal = stockEntry ? stockEntry.totalPPQuantity : 0;
 
-      let stockEntry = product.stockByUnit.find(
-        (s) => s.unitId.toString() === unitId
-      );
-
-      if (!stockEntry) {
-        product.stockByUnit.push({
-          unitId,
-          totalPPQuantity: quantity,
-          committedPPQuantity: 0,
-          availableToCommitPPQuantity: quantity
-        });
-      } else {
-        stockEntry.totalPPQuantity += quantity;
-        stockEntry.availableToCommitPPQuantity += quantity;
-      }
-
-      await product.save();
-
-      const updatedEntry = product.stockByUnit.find(
-        (s) => s.unitId.toString() === unitId
-      );
-
-      results.push({
-        parentProductName,
-        status: 'success',
-        data: {
-          productid: product._id,
-          unitId: updatedEntry.unitId,
-          totalPPQuantity: updatedEntry.totalPPQuantity,
-          committedPPQuantity: updatedEntry.committedPPQuantity,
-          availableToCommitPPQuantity: updatedEntry.availableToCommitPPQuantity
+      // 1. Prepare Atomic Update
+      // Try to update existing unit entry first
+      bulkOps.push({
+        updateOne: {
+          filter: { _id: product._id, "stockByUnit.unitId": unitObjectId },
+          update: { 
+            $inc: { 
+              "stockByUnit.$.totalPPQuantity": quantity, 
+              "stockByUnit.$.availableToCommitPPQuantity": quantity 
+            } 
+          }
         }
+      });
+
+      // 2. Prepare Push for New Units
+      // We use a second op that only runs if the unitId doesn't exist
+      bulkOps.push({
+        updateOne: {
+          filter: { _id: product._id, "stockByUnit.unitId": { $ne: unitObjectId } },
+          update: { 
+            $push: { 
+              stockByUnit: { 
+                unitId: unitObjectId, totalPPQuantity: quantity, 
+                committedPPQuantity: 0, availableToCommitPPQuantity: quantity 
+              } 
+            } 
+          }
+        }
+      });
+
+      affectedProductIds.add(product._id.toString());
+      
+      // 3. Prepare Log Data
+      logsToCreate.push({
+        entityName: parentProductName,
+        module: "ParentProduct",
+        oldValue: oldTotal,
+        newValue: oldTotal + quantity,
+        activityValue: quantity,
+        parentProductId: product._id,
+        unitId: unitId,
+        description: `Bulk added ${quantity} units. Total: ${oldTotal + quantity}`
       });
     }
 
-    res.status(200).json({
-      message: 'Bulk stock update for ParentProduct completed',
-      results
-    });
+    // Execute all updates in one batch
+    if (bulkOps.length > 0) {
+      await ParentProduct.bulkWrite(bulkOps, { session });
+      
+      // 4. Trigger Recalculations for all unique impacted products
+      for (const pId of affectedProductIds) {
+        // Ensure your recalculate function uses the session!
+        await recalculateMainParentsForParent(pId, stocks[0].unitId, session);
+      }
+      
+      // 5. Batch Insert Logs
+      if (logsToCreate.length > 0) {
+        await logCountChange.insertMany(logsToCreate, { session });
+      }
+    }
+
+    await session.commitTransaction();
+    session.endSession();
+    res.status(200).json({ message: 'Bulk stock update completed successfully' });
+
   } catch (err) {
+    if (session.inTransaction()) await session.abortTransaction();
+    session.endSession();
     res.status(500).json({ message: err.message });
   }
 };
 
 exports.recalculateMainParentStocks = async (req, res) => {
   const session = await mongoose.startSession();
-  
+  session.startTransaction();
   try {
-    session.startTransaction();
-    
     const { unitId, skip = 0, limit = 500 } = req.body;
-
-    if (!unitId) {
-      await session.abortTransaction();
-      return res.status(400).json({
-        success: false,
-        message: "unitId is required"
-      });
-    }
-
-    // Convert unitId to string for consistent comparison
     const unitIdStr = unitId.toString();
 
-    // Fetch main parents with session
-    const mainParents = await MainParent.find()
-      .skip(Number(skip))
-      .limit(Number(limit))
-      .session(session);
+    const mainParents = await MainParent.find().skip(Number(skip)).limit(Number(limit)).session(session).lean();
+    if (!mainParents.length) {
+        await session.commitTransaction();
+        return res.status(200).json({ message: "Completed" });
+    }
 
-    if (!mainParents || mainParents.length === 0) {
-      await session.commitTransaction();
-      return res.status(200).json({
-        success: true,
-        message: `No main parents found for batch skip=${skip}, limit=${limit}`
+    // Collect parent product IDs to fetch stock in one query
+    const ppIds = [...new Set(mainParents.flatMap(mp => mp.parentProducts?.map(p => p.parentProductId) || []))];
+    const pps = await ParentProduct.find({ _id: { $in: ppIds } }).session(session).lean();
+    const ppMap = new Map(pps.map(p => [p._id.toString(), p]));
+
+    const bulkOps = [];
+
+    for (const mp of mainParents) {
+      let minPossible = Infinity;
+      if (!mp.parentProducts?.length) continue;
+
+      for (const config of mp.parentProducts) {
+        const pp = ppMap.get(config.parentProductId?.toString());
+        const stock = pp?.stockByUnit?.find(s => s.unitId.toString() === unitIdStr);
+        const available = stock?.availableToCommitPPQuantity || 0;
+        minPossible = Math.min(minPossible, Math.floor(available / (config.quantity || 1)));
+      }
+      
+      const finalQty = minPossible === Infinity ? 0 : minPossible;
+
+      // ATOMIC UPDATE: Only update the specific array element
+      bulkOps.push({
+        updateOne: {
+          filter: { _id: mp._id, "stockByUnit.unitId": unitId },
+          update: { 
+            $set: { 
+                "stockByUnit.$.totalMPQuantity": finalQty,
+                "stockByUnit.$.availableToCommitMPQuantity": finalQty // Adjust this if you need to subtract committed
+            } 
+          }
+        }
       });
     }
 
-    // Collect all unique parent product IDs
-    const parentProductIds = new Set();
-    mainParents.forEach(mp => {
-      if (mp.parentProducts && Array.isArray(mp.parentProducts)) {
-        mp.parentProducts.forEach(config => {
-          if (config.parentProductId) {
-            parentProductIds.add(config.parentProductId.toString());
-          }
-        });
-      }
-    });
+    if (bulkOps.length > 0) await MainParent.bulkWrite(bulkOps, { session });
 
-    // Fetch all parent products in ONE query
-    const parentProducts = await ParentProduct.find({
-      _id: { $in: Array.from(parentProductIds) }
-    }).session(session);
-
-    // Create a Map for O(1) lookup
-    const ppMap = new Map();
-    parentProducts.forEach(pp => {
-      ppMap.set(pp._id.toString(), pp);
-    });
-
-    let processedCount = 0;
-    let updatedCount = 0;
-
-    // Process each main parent
-    for (const mp of mainParents) {
-      const requiredParents = mp.parentProducts || [];
-      
-      // Skip if no parent products configured
-      if (requiredParents.length === 0) {
-        // console.log(`⚠️  MainParent ${mp._id} has no parent products configured`);
-        continue;
-      }
-
-      let minPossibleUnits = Infinity;
-      let hasError = false;
-      const calculations = []; // For debugging
-
-      // Calculate minimum possible units based on parent products
-      for (const config of requiredParents) {
-        const ppId = config.parentProductId?.toString();
-        
-        // Validate parent product ID exists
-        if (!ppId) {
-          console.warn(`⚠️  MainParent ${mp._id}: Missing parentProductId in config`);
-          minPossibleUnits = 0;
-          hasError = true;
-          break;
-        }
-
-        // Validate quantity is a positive number
-        const requiredQty = Number(config.quantity);
-        if (!requiredQty || requiredQty <= 0 || isNaN(requiredQty)) {
-          console.warn(`⚠️  MainParent ${mp._id}: Invalid quantity for PP ${ppId}: ${config.quantity}`);
-          minPossibleUnits = 0;
-          hasError = true;
-          break;
-        }
-
-        // Get parent product from map
-        const pp = ppMap.get(ppId);
-        
-        if (!pp) {
-          console.warn(`⚠️  MainParent ${mp._id}: Parent Product ${ppId} not found in database`);
-          minPossibleUnits = 0;
-          hasError = true;
-          break;
-        }
-
-        // Find stock for this specific unit
-        const stockByUnit = pp.stockByUnit?.find(
-          (s) => s.unitId?.toString() === unitIdStr
-        );
-
-        const availableQty = Number(stockByUnit?.availableToCommitPPQuantity) || 0;
-
-        // Calculate how many complete units can be made with this parent product
-        const possibleUnits = Math.floor(availableQty / requiredQty);
-        
-        // Store calculation for debugging
-        calculations.push({
-          ppId: ppId,
-          ppName: pp.name || 'N/A',
-          requiredQty: requiredQty,
-          availableQty: availableQty,
-          possibleUnits: possibleUnits
-        });
-
-        // Update minimum
-        minPossibleUnits = Math.min(minPossibleUnits, possibleUnits);
-      }
-
-      // Log calculation details for debugging
-      // console.log(`\n📊 MainParent ${mp._id} (${mp.name || 'N/A'}):`);
-      // console.log('Calculations:', JSON.stringify(calculations, null, 2));
-      // console.log(`Final minPossibleUnits: ${minPossibleUnits}`);
-
-      // Handle edge cases
-      if (minPossibleUnits === Infinity) {
-        console.warn(`⚠️  MainParent ${mp._id}: No valid calculations (Infinity)`);
-        minPossibleUnits = 0;
-      }
-      
-      if (minPossibleUnits < 0) {
-        console.warn(`⚠️  MainParent ${mp._id}: Negative result, setting to 0`);
-        minPossibleUnits = 0;
-      }
-
-      // Initialize stockByUnit array if it doesn't exist
-      if (!mp.stockByUnit || !Array.isArray(mp.stockByUnit)) {
-        mp.stockByUnit = [];
-      }
-
-      // Find existing stock entry for this unit
-      const stockIndex = mp.stockByUnit.findIndex(
-        (s) => s.unitId?.toString() === unitIdStr
-      );
-
-      if (stockIndex === -1) {
-        // Create new stock entry
-        // console.log(`✅ Creating new stock entry for unit ${unitIdStr}`);
-        mp.stockByUnit.push({
-          unitId:new mongoose.Types.ObjectId(unitIdStr),
-          totalMPQuantity: minPossibleUnits,
-          committedMPQuantity: 0,
-          availableToCommitMPQuantity: minPossibleUnits
-        });
-        updatedCount++;
-      } else {
-        // Update existing stock entry
-        const existingCommitted = Number(mp.stockByUnit[stockIndex].committedMPQuantity) || 0;
-        const oldTotal = mp.stockByUnit[stockIndex].totalMPQuantity;
-        
-        mp.stockByUnit[stockIndex].totalMPQuantity = minPossibleUnits;
-        mp.stockByUnit[stockIndex].availableToCommitMPQuantity = 
-          Math.max(0, minPossibleUnits - existingCommitted);
-        
-        // console.log(`✅ Updated stock: ${oldTotal} → ${minPossibleUnits} (committed: ${existingCommitted})`);
-        updatedCount++;
-      }
-
-      // Mark as modified for Mongoose to detect changes in nested arrays
-      mp.markModified('stockByUnit');
-      
-      // Save with session
-      await mp.save({ session });
-      processedCount++;
-    }
-
-    // Commit transaction
     await session.commitTransaction();
-
-    // console.log(`\n✅ Transaction committed successfully`);
-    // console.log(`Processed: ${processedCount}, Updated: ${updatedCount}`);
-
-    return res.status(200).json({
-      success: true,
-      message: `MainParentProduct stocks recalculated for unit ${unitIdStr}`,
-      details: {
-        batch: { skip: Number(skip), limit: Number(limit) },
-        processed: processedCount,
-        updated: updatedCount
-      }
-    });
-
+    res.status(200).json({ success: true, processed: mainParents.length });
   } catch (error) {
-    // Abort transaction on any error
     await session.abortTransaction();
-    
-    console.error("🔥 Error recalculating main parent stocks:", error);
-    console.error("Stack trace:", error.stack);
-    
-    return res.status(500).json({
-      success: false,
-      message: "Error recalculating stocks",
-      error: error.message,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    });
+    res.status(500).json({ message: error.message });
   } finally {
-    // Always end the session
     session.endSession();
   }
 };
@@ -625,443 +425,267 @@ exports.recalculateMainParentStocks = async (req, res) => {
 // };
 
 exports.addStockToMainParentProduct = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
     const { productid, quantity, unitId } = req.body;
-    
     const unitObjectId = new mongoose.Types.ObjectId(unitId);
 
-    const unitDet = await Unit.findById(unitObjectId);
-    const mainParent = await MainParent.findById(productid);
+    // 1. ATOMIC UPDATE & FETCH (Main Parent)
+    // We use findOneAndUpdate to get the old stock for logging while updating
+    const mainParent = await MainParent.findOneAndUpdate(
+      { _id: productid, "stockByUnit.unitId": unitObjectId },
+      { $inc: { "stockByUnit.$.totalMPQuantity": quantity, "stockByUnit.$.availableToCommitMPQuantity": quantity } },
+      { session, new: false } // Returns state BEFORE update
+    );
+
+    let oldTotal = 0;
 
     if (!mainParent) {
-      return res.status(404).json({ message: 'Main Parent Product not found' });
-    }
-
-    const stockEntry = mainParent.stockByUnit.find(
-      (s) => s.unitId.toString() === unitId
-    );
-    const oldTotal = stockEntry?.totalMPQuantity || 0;
-
-    // Perform Atomic Update on Main Parent
-    const mpUpdateResult = await MainParent.updateOne(
-      { _id: mainParent._id, "stockByUnit.unitId": unitObjectId },
-      {
-        $inc: {
-          "stockByUnit.$.totalMPQuantity": quantity,
-          "stockByUnit.$.availableToCommitMPQuantity": quantity
-        }
-      }
-    );
-
-    // If unit didn't exist, push it
-    if (mpUpdateResult.modifiedCount === 0) {
-      await MainParent.updateOne(
-        { _id: mainParent._id },
-        {
-          $push: {
-            stockByUnit: {
-              unitId: unitObjectId,
-              totalMPQuantity: quantity,
-              committedMPQuantity: 0,
-              availableToCommitMPQuantity: quantity
-            }
-          }
-        }
+      // Unit doesn't exist yet, push it safely
+      const freshMain = await MainParent.findByIdAndUpdate(
+        productid,
+        { 
+          $push: { 
+            stockByUnit: { 
+              unitId: unitObjectId, totalMPQuantity: quantity, 
+              committedMPQuantity: 0, availableToCommitMPQuantity: quantity 
+            } 
+          } 
+        },
+        { session, new: true }
       );
+      if (!freshMain) throw new Error('Main Parent Product not found');
+    } else {
+      const stockEntry = mainParent.stockByUnit.find(s => s.unitId.toString() === unitId);
+      oldTotal = stockEntry?.totalMPQuantity || 0;
     }
 
-    // Refresh MainParent to get updated data for logs/logic
-    const updatedMainParent = await MainParent.findById(productid);
+    // Refresh data for constituent loop
+    const activeMainParent = await MainParent.findById(productid).session(session);
 
-    // ✅ 2. Update Parent Products & Child Products Atomically
-    const affectedPPIds = [];
-
-    for (const pp of updatedMainParent.parentProducts) {
+    // 2. CONSTITUENT UPDATES (Parents & Children)
+    for (const pp of activeMainParent.parentProducts) {
       const requiredPPQty = pp.quantity * quantity;
-      affectedPPIds.push(pp.parentProductId.toString());
 
-      // We still need to find the parent to get its child configuration
-      const parentDoc = await ParentProduct.findById(pp.parentProductId);
-      if (!parentDoc) continue;
-
-      // -- ATOMIC UPDATE FOR PARENT PRODUCT --
-      const ppUpdate = await ParentProduct.updateOne(
+      // Update Parent Product
+      const updatedPP = await ParentProduct.findOneAndUpdate(
         { _id: pp.parentProductId, "stockByUnit.unitId": unitObjectId },
-        {
-          $inc: {
-            "stockByUnit.$.totalPPQuantity": requiredPPQty,
-            "stockByUnit.$.availableToCommitPPQuantity": requiredPPQty
-          }
-        }
+        { $inc: { "stockByUnit.$.totalPPQuantity": requiredPPQty, "stockByUnit.$.availableToCommitPPQuantity": requiredPPQty } },
+        { session, new: true }
       );
 
-      // If unit doesn't exist in Parent, push it
-      if (ppUpdate.modifiedCount === 0) {
+      // If unit didn't exist in Parent, push it
+      if (!updatedPP) {
         await ParentProduct.updateOne(
           { _id: pp.parentProductId },
-          {
-            $push: {
-              stockByUnit: {
-                unitId: unitObjectId,
-                totalPPQuantity: requiredPPQty,
-                committedPPQuantity: 0,
-                availableToCommitPPQuantity: requiredPPQty
-              }
-            }
-          }
+          { 
+            $push: { 
+              stockByUnit: { 
+                unitId: unitObjectId, totalPPQuantity: requiredPPQty, 
+                committedPPQuantity: 0, availableToCommitPPQuantity: requiredPPQty 
+              } 
+            } 
+          },
+          { session }
         );
       }
 
-      // -- ATOMIC UPDATE FOR CHILD PRODUCTS --
+      // Re-fetch parent to get child config (to ensure we have latest child mappings)
+      const parentDoc = await ParentProduct.findById(pp.parentProductId).session(session).lean();
+      
+      // Update Child Products
       for (const cp of parentDoc.childProducts) {
         const requiredChildQty = requiredPPQty * cp.quantity;
-
         const cpUpdate = await ChildProduct.updateOne(
           { _id: cp.childProductId, "stockByUnit.unitId": unitObjectId },
-          {
-            $inc: {
-              "stockByUnit.$.totalCPQuantity": requiredChildQty,
-              "stockByUnit.$.availableToCommitCPQuantity": requiredChildQty
-            }
-          }
+          { $inc: { "stockByUnit.$.totalCPQuantity": requiredChildQty, "stockByUnit.$.availableToCommitCPQuantity": requiredChildQty } },
+          { session }
         );
 
         if (cpUpdate.modifiedCount === 0) {
           await ChildProduct.updateOne(
             { _id: cp.childProductId },
-            {
-              $push: {
-                stockByUnit: {
-                  unitId: unitObjectId,
-                  totalCPQuantity: requiredChildQty,
-                  committedCPQuantity: 0,
-                  availableToCommitCPQuantity: requiredChildQty
-                }
-              }
-            }
+            { 
+              $push: { 
+                stockByUnit: { 
+                  unitId: unitObjectId, totalCPQuantity: requiredChildQty, 
+                  committedCPQuantity: 0, availableToCommitCPQuantity: requiredChildQty 
+                } 
+              } 
+            },
+            { session }
           );
         }
       }
+
+      // 3. RECALCULATE IMPACTED MAIN PARENTS
+      await recalculateMainParentsForParent(pp.parentProductId, unitId, session);
     }
 
-    // ✅ 3. Recalculate other MainParents
-    // (This logic remains largely checking 'available' stock, so it's fine as is, 
-    // but ensures we read the freshest data from DB)
-    const otherMainParents = await MainParent.find({
-      _id: { $ne: mainParent._id },
-      'parentProducts.parentProductId': { $in: affectedPPIds }
-    });
-
-    for (const mp of otherMainParents) {
-      let minPossibleUnits = Infinity;
-
-      // Check all parent products required by this MainParent
-      for (const config of mp.parentProducts) {
-        const pp = await ParentProduct.findById(config.parentProductId);
-        const ppStock = pp?.stockByUnit.find(
-          s => s.unitId.toString() === unitId
-        );
-        const available = ppStock?.totalPPQuantity || 0; // Or availableToCommitPPQuantity based on your logic
-        const possibleUnits = Math.floor(available / config.quantity);
-        minPossibleUnits = Math.min(minPossibleUnits, possibleUnits);
-      }
-
-      // Update the calculated stock
-      if (minPossibleUnits !== Infinity) {
-        // We use atomic set here to ensure we don't accidentally push duplicate units
-        // or overwrite with stale data if possible.
-        const mpStockUpdate = await MainParent.updateOne(
-          { _id: mp._id, "stockByUnit.unitId": unitObjectId },
-          {
-            $set: {
-              "stockByUnit.$.totalMPQuantity": minPossibleUnits,
-              "stockByUnit.$.availableToCommitMPQuantity": minPossibleUnits
-            }
-          }
-        );
-
-        if (mpStockUpdate.modifiedCount === 0 && minPossibleUnits > 0) {
-           await MainParent.updateOne(
-            { _id: mp._id },
-            {
-              $push: {
-                stockByUnit: {
-                  unitId: unitObjectId,
-                  totalMPQuantity: minPossibleUnits,
-                  committedMPQuantity: 0,
-                  availableToCommitMPQuantity: minPossibleUnits
-                }
-              }
-            }
-          );
-        }
-      }
-    }
-
-    // ✅ 4. Log the addition
-    // We use the 'updatedMainParent' fetched earlier to get the correct new values
-    const newStockEntry = updatedMainParent.stockByUnit.find(
-      (s) => s.unitId.toString() === unitId
-    );
-
+    // 4. LOGGING & COMMIT
     await logCountChange.logCountChange({
       req,
-      entityName: updatedMainParent.mainParentProductName,
-      entityCode: updatedMainParent.mainParentProductCode,
+      entityName: activeMainParent.mainParentProductName,
+      entityCode: activeMainParent.mainParentProductCode,
       module: "MainParentProduct",
       changeField: "totalMPQuantity",
       oldValue: oldTotal,
-      newValue: newStockEntry ? newStockEntry.totalMPQuantity : quantity,
+      newValue: oldTotal + quantity,
       activityValue: quantity,
-      description: `Added ${quantity} Quantities of ${updatedMainParent.mainParentProductName} in ${unitDet?.UnitName || 'Unit'}, Old Stock - ${oldTotal}, Current Stock - ${newStockEntry ? newStockEntry.totalMPQuantity : quantity}`,
-      mainParentId: updatedMainParent._id,
+      description: `Stock Added: ${oldTotal} -> ${oldTotal + quantity}`,
+      mainParentId: activeMainParent._id,
       unitId: unitId
     });
 
-    res.status(200).json({
-      message: 'Stock added to Main Parent Product and dependent MainParents recalculated.',
-      data: updatedMainParent
-    });
+    await session.commitTransaction();
+    res.status(200).json({ message: 'Stock added successfully.' });
 
   } catch (err) {
-    console.error("🔥 ERROR:", err);
+    await session.abortTransaction();
+    console.error("🔥 TRANSACTION ABORTED:", err);
     res.status(500).json({ message: err.message });
+  } finally {
+    session.endSession();
   }
 };
 
 exports.adjustStock = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
-    const {
-      unitId,
-      productid,
-      quantity,
-      productType,
-      Reason,
-      Description,
-      user
-    } = req.body;
+    const { unitId, productid, quantity, productType, Reason, Description, user } = req.body;
 
     if (!unitId || !productid || !quantity || !productType) {
-      return res.status(400).json({
-        message: "unitId, productid, quantity, and productType are required."
-      });
+      throw new Error("Missing required fields.");
     }
 
-    if (quantity <= 0) {
-      return res.status(400).json({
-        message: "Quantity must be a positive number."
-      });
-    }
-
-    let model;
-    let totalField, availableField;
-    let productDoc;
-    let entityName;
-    let entityCode;
-
+    let model, totalField, availableField, nameField, codeField;
     switch (productType) {
       case "Child Product":
         model = ChildProduct;
-        totalField = "stockByUnit.$.totalCPQuantity";
-        availableField = "stockByUnit.$.availableToCommitCPQuantity";
+        totalField = "totalCPQuantity";
+        availableField = "availableToCommitCPQuantity";
+        nameField = "childProductName"; codeField = "childProductCode";
         break;
-
       case "Parent Product":
         model = ParentProduct;
-        totalField = "stockByUnit.$.totalPPQuantity";
-        availableField = "stockByUnit.$.availableToCommitPPQuantity";
+        totalField = "totalPPQuantity";
+        availableField = "availableToCommitPPQuantity";
+        nameField = "parentProductName"; codeField = "parentProductCode";
         break;
-
       case "Main Parent":
         model = MainParent;
-        totalField = "stockByUnit.$.totalMPQuantity";
-        availableField = "stockByUnit.$.availableToCommitMPQuantity";
+        totalField = "totalMPQuantity";
+        availableField = "availableToCommitMPQuantity";
+        nameField = "mainParentProductName"; codeField = "mainParentProductCode";
         break;
-
       default:
-        return res.status(400).json({
-          message: `Invalid productType: ${productType}`
-        });
+        throw new Error("Invalid product type.");
     }
 
-    productDoc = await model.findById(productid);
-    if (!productDoc) {
-      return res.status(404).json({
-        message: `No ${productType} found for id ${productid}`
-      });
-    }
-
-    const stock = productDoc.stockByUnit.find(
-      (s) => s.unitId?.toString() === unitId
-    );
-console.log(stock,"stock")
-    if (!stock) {
-      return res.status(404).json({
-        message: `No stock found for ${unitDet.UnitName} in ${productType}`
-      });
-    }
-
-    // Check if enough stock is available to reduce
-    const currentQty = stock.availableToCommitCPQuantity ?? stock.availableToCommitPPQuantity ?? stock.availableToCommitMPQuantity ?? 0;
-    if (currentQty < quantity) {
-      return res.status(400).json({
-        message: `Cannot reduce stock below zero. Available total: ${currentQty}`
-      });
-    }
-
-    // Reduce the stock
-    const update = {
-      $inc: {
-        [totalField]: -quantity,
-        [availableField]: -quantity
-      }
-    };
-
-    await model.updateOne(
-      {
-        _id: productid,
-        "stockByUnit.unitId": unitId
+    // 1. ATOMIC ADJUSTMENT (Primary Product)
+    const updatedDoc = await model.findOneAndUpdate(
+      { 
+        _id: productid, 
+        "stockByUnit.unitId": unitId,
+        // Safety: Ensure we don't adjust below zero if quantity is positive (reduction)
+        [`stockByUnit.${availableField}`]: { $gte: quantity } 
       },
-      update
+      { 
+        $inc: { 
+          [`stockByUnit.$.${totalField}`]: -quantity, 
+          [`stockByUnit.$.${availableField}`]: -quantity 
+        } 
+      },
+      { session, new: false } // Get state BEFORE update for logging
     );
 
-    // Entity name for logs
-    if (productType === "Child Product") {
-      entityName = productDoc.childProductName || "";
-      entityCode = productDoc.childProductCode || ""
-    } else if (productType === "Parent Product") {
-      entityName = productDoc.parentProductName || "";
-      entityCode = productDoc.parentProductCode || ""
-    } else if (productType === "Main Parent") {
-      entityName = productDoc.mainParentProductName || "";
-      entityCode = productDoc.mainParentProductCode || ""
-    }
+    if (!updatedDoc) throw new Error("Insufficient stock or product not found.");
 
-    if (productType === "Parent Product") {
-      await recalculateMainParentsForParent(productid, unitId);
-    }
+    const stockObj = updatedDoc.stockByUnit.find(s => s.unitId.toString() === unitId.toString());
+    const currentQty = stockObj[availableField] || 0;
 
-    if (productType === "Main Parent") {
-      const mainParent = await MainParent.findById(productid);
-      if (mainParent && mainParent.parentProducts?.length > 0) {
-        for (const config of mainParent.parentProducts) {
-          const ppId = config.parentProductId;
-          const requiredQty = config.quantity;
-          const reduceBy = requiredQty * quantity;
+    // 2. SYNC CONSTITUENTS (If Main Parent)
+    if (productType === "Main Parent" && updatedDoc.parentProducts?.length > 0) {
+      for (const config of updatedDoc.parentProducts) {
+        const reduceBy = config.quantity * quantity;
+        if (reduceBy <= 0) continue;
 
-          if (reduceBy > 0) {
-            await ParentProduct.updateOne(
-              {
-                _id: ppId,
-                "stockByUnit.unitId": unitId
-              },
-              {
-                $inc: {
-                  "stockByUnit.$.totalPPQuantity": -reduceBy,
-                  "stockByUnit.$.availableToCommitPPQuantity": -reduceBy
-                }
-              }
-            );
-
-            // Recalculate MPs impacted by this parent product
-            await recalculateMainParentsForParent(ppId, unitId);
-          }
-        }
+        const ppUpdate = await ParentProduct.updateOne(
+          { _id: config.parentProductId, "stockByUnit.unitId": unitId, "stockByUnit.availableToCommitPPQuantity": { $gte: reduceBy } },
+          { $inc: { "stockByUnit.$.totalPPQuantity": -reduceBy, "stockByUnit.$.availableToCommitPPQuantity": -reduceBy } },
+          { session }
+        );
+        if (ppUpdate.modifiedCount === 0) throw new Error(`Constituent ${config.parentProductId} update failed.`);
+        
+        await recalculateMainParentsForParent(config.parentProductId, unitId, session);
       }
     }
 
-    // Log activity
+    // 3. RECALCULATE (If Parent Product)
+    if (productType === "Parent Product") {
+      await recalculateMainParentsForParent(productid, unitId, session);
+    }
+
+    // 4. LOGGING
     await logCountChange.logCreate({
-      employeeId: user?.employeeId || null,
-      employeeCode: user?.employeeCode || null,
-      employeeName: user?.employeeName || null,
-      departmentId: user?.departmentId || null,
-      departmentName: null,
-      role: user?.role || null,
-      unitId: unitId,
-      unitName: user?.unitName || null,
-
-      childProductId: productType === "Child Product" ? productid : null,
-      parentProductId: productType === "Parent Product" ? productid : null,
-      mainParentId: productType === "Main Parent" ? productid : null,
-
+      employeeId: user?.employeeId, unitId, 
       action: "stock_adjustment",
-      module: "Stock",
-      entityName: entityName,
-      entityCode: entityCode || "",
-      changeField: "totalQuantity",
+      entityName: updatedDoc[nameField],
       oldValue: currentQty,
       activityValue: -quantity,
       newValue: currentQty - quantity,
-      description: `Stock adjusted from ${currentQty} by -${quantity} and the new quantity is ${currentQty - quantity}. Reason: ${Reason}. Details: ${Description}`,
-      ipAddress: req.ip,
-      userAgent: req.headers["user-agent"]
-    });
+      description: `Stock adjusted. Reason: ${Reason}. Details: ${Description}`,
+      ipAddress: req.ip, userAgent: req.headers["user-agent"]
+    }, { session });
 
-    return res.status(200).json({
-      message: `Stock adjusted successfully for ${productType}.`,
-      adjustedProductId: productid,
-      adjustedQuantity: quantity
-    });
+    await session.commitTransaction();
+    session.endSession();
+
+    return res.status(200).json({ message: "Stock adjusted successfully." });
 
   } catch (error) {
-    console.error(error);
-    return res.status(500).json({
-      message: error.message || "Error adjusting stock."
-    });
+    if (session.inTransaction()) await session.abortTransaction();
+    session.endSession();
+    return res.status(500).json({ message: error.message });
   }
 };
 
-async function recalculateMainParentsForParent(parentProductId, unitId) {
-  const mainParents = await MainParent.find({
-    "parentProducts.parentProductId": parentProductId
+async function recalculateMainParentsForParent(parentProductId, unitId, session = null) {
+  const mainParents = await MainParent.find({ "parentProducts.parentProductId": parentProductId }).session(session).lean();
+  if (!mainParents.length) return;
+
+  // Fetch ONLY the parent products required for these specific Main Parents
+  const requiredPPIds = [...new Set(mainParents.flatMap(mp => mp.parentProducts.map(p => p.parentProductId)))];
+  const pps = await ParentProduct.find({ _id: { $in: requiredPPIds } }).session(session).lean();
+  const ppMap = new Map(pps.map(p => [p._id.toString(), p]));
+
+  const bulkOps = mainParents.map(mp => {
+    let minPossible = Infinity;
+    for (const config of mp.parentProducts) {
+      const pp = ppMap.get(config.parentProductId.toString());
+      const stock = pp?.stockByUnit?.find(s => s.unitId.toString() === unitId.toString());
+      const available = stock?.availableToCommitPPQuantity || 0;
+      minPossible = Math.min(minPossible, Math.floor(available / (config.quantity || 1)));
+    }
+
+    return {
+      updateOne: {
+        filter: { _id: mp._id, "stockByUnit.unitId": unitId },
+        update: { 
+          $set: { 
+            "stockByUnit.$.totalMPQuantity": minPossible === Infinity ? 0 : minPossible,
+            "stockByUnit.$.availableToCommitMPQuantity": minPossible === Infinity ? 0 : minPossible 
+          } 
+        }
+      }
+    };
   });
 
-  const allPPs = await ParentProduct.find();
-  const ppMap = new Map();
-  allPPs.forEach(pp => ppMap.set(pp._id.toString(), pp));
-
-  for (const mp of mainParents) {
-    let minPossibleMPs = Infinity;
-
-    for (const config of mp.parentProducts) {
-      const ppId = config.parentProductId;
-      const qtyNeeded = config.quantity;
-
-      const pp = ppMap.get(ppId.toString());
-      if (!pp) {
-        minPossibleMPs = 0;
-        break;
-      }
-
-      const stockByUnit = pp.stockByUnit.find(
-        (s) => s.unitId?.toString() === unitId
-      );
-
-      const available = stockByUnit?.availableToCommitPPQuantity || 0;
-      const possibleUnits = qtyNeeded > 0 ? Math.floor(available / qtyNeeded) : 0;
-      minPossibleMPs = Math.min(minPossibleMPs, possibleUnits);
-    }
-
-    if (minPossibleMPs === Infinity) minPossibleMPs = 0;
-
-    const mpStock = mp.stockByUnit.find(
-      (s) => s.unitId?.toString() === unitId
-    );
-
-    if (mpStock) {
-      mpStock.totalMPQuantity = minPossibleMPs;
-      mpStock.availableToCommitMPQuantity = minPossibleMPs;
-    } else {
-      mp.stockByUnit.push({
-        unitId,
-        totalMPQuantity: minPossibleMPs,
-        availableToCommitMPQuantity: minPossibleMPs
-      });
-    }
-
-    await mp.save();
-  }
+  if (bulkOps.length > 0) await MainParent.bulkWrite(bulkOps, { session });
 }
 
 
