@@ -1165,36 +1165,44 @@ exports.updateAssignedQuantities = async (req, res) => {
       const parentMap = new Map(freshParents.map(p => [p._id.toString(), p]));
       const mainMap = new Map(freshMains.map(m => [m._id.toString(), m]));
 
-      const enrichedDetails = order.productDetails.map((detail) => {
-        const detailObj = detail.toObject();
-        let currentStock = 0;
+      const enrichedDetails = order.productDetails.map((detail) => {
+        const type = detail.productTypeId ? maps.type.get(detail.productTypeId.toString()) : null;
+        let stockQty = 0;
+        let nameInfo = {};
 
-        if (detail.parentProductId) {
-          const p = parentMap.get(detail.parentProductId.toString());
-          const s = p?.stockByUnit?.find(u => u.unitId.toString() === unitId.toString());
-          currentStock = s?.availableToCommitPPQuantity || 0;
-        } else if (detail.mainParentId) {
-          const m = mainMap.get(detail.mainParentId.toString());
-          const s = m?.stockByUnit?.find(u => u.unitId.toString() === unitId.toString());
-          currentStock = s?.totalMPQuantity || 0;
-        }
+        if (detail.parentProductId) {
+          const d = maps.parent.get(detail.parentProductId.toString());
+          if (d) {
+            const stockRecord = d.stockByUnit?.find(s => s.unitId.toString() === unitId.toString());
+            stockQty = stockRecord?.availableToCommitPPQuantity || 0;
+            nameInfo = { parentProductName: d.parentProductName };
+          }
+        } else if (detail.mainParentId) {
+          const d = maps.main.get(detail.mainParentId.toString());
+          if (d) {
+            const stockRecord = d.stockByUnit?.find(s => s.unitId.toString() === unitId.toString());
+            stockQty = stockRecord?.totalMPQuantity || 0;
+            nameInfo = { mainParentProductName: d.mainParentProductName };
+          }
+        }
 
-        return { ...detailObj, availableQuantity: currentStock };
-      });
+        return { ...detail.toObject(), productTypeName: type?.productTypeName, ...nameInfo, availableQuantity: stockQty };
+      });
 
-      return res.status(200).json({ 
-        message: "Assigned quantities updated successfully.", 
-        updatedProductDetails: enrichedDetails 
-      });
-    }
+      session.endSession();
+      return res.status(200).json({ message: "Assigned quantities updated successfully.", updatedProductDetails: enrichedDetails });
 
-    throw new Error("No products were updated.");
+    } else {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({ message: "No matching product details found to update." });
+    }
 
-  } catch (error) {
-    if (session.inTransaction()) await session.abortTransaction();
-    session.endSession();
-    return res.status(500).json({ message: error.message });
-  }
+  } catch (error) {
+    if (session.inTransaction()) await session.abortTransaction();
+    session.endSession();
+    return res.status(500).json({ message: error.message || "Server error" });
+  }
 };
 
 exports.confirmOrder = async (req, res) => {
