@@ -1081,10 +1081,13 @@ exports.updateAssignedQuantities = async (req, res) => {
 
   try {
     const { orderId, productDetails, unitId, user } = req.body;
+    
+    // Fetch order inside session
     const order = await Order.findById(orderId).session(session);
     if (!order) throw new Error("Order not found.");
 
     const logsToCreate = [];
+    const modifiedProductIds = { parent: new Set(), main: new Set() };
     let updatedCount = 0;
 
     for (const incoming of productDetails) {
@@ -1104,9 +1107,8 @@ exports.updateAssignedQuantities = async (req, res) => {
 
       if (isNaN(newAssignedQty) || newAssignedQty < 0 || diff === 0) continue;
 
-      let updatedDoc;
       if (parentProductId) {
-        updatedDoc = await ParentProduct.findOneAndUpdate(
+        const updatedDoc = await ParentProduct.findOneAndUpdate(
           { 
             _id: parentProductId, 
             "stockByUnit.unitId": unitId,
@@ -1116,7 +1118,7 @@ exports.updateAssignedQuantities = async (req, res) => {
           { 
             session, 
             arrayFilters: [{ "elem.unitId": unitId }],
-            new: false, // Accurate "Before" state for your logs
+            new: false, // returns doc BEFORE update for logs
             projection: { stockByUnit: { $elemMatch: { unitId } }, parentProductName: 1, parentProductCode: 1 } 
           }
         );
@@ -1127,6 +1129,7 @@ exports.updateAssignedQuantities = async (req, res) => {
         const stockAfter = stockBefore - diff;
 
         await recalculateMainParentsForParent(parentProductId, unitId, session);
+        modifiedProductIds.parent.add(parentProductId.toString());
 
         // YOUR EXACT LOG FORMAT
         logsToCreate.push({
@@ -1148,15 +1151,49 @@ exports.updateAssignedQuantities = async (req, res) => {
     if (updatedCount > 0) {
       await order.save({ session });
       if (logsToCreate.length) await Logs.insertMany(logsToCreate, { session });
+      
       await session.commitTransaction();
-      return res.status(200).json({ message: "Success" });
+      session.endSession();
+
+      // --- FETCH UPDATED DETAILS FOR RESPONSE ---
+      // We do this after commit to ensure data consistency
+      const [freshParents, freshMains] = await Promise.all([
+        modifiedProductIds.parent.size ? ParentProduct.find({ _id: { $in: Array.from(modifiedProductIds.parent) } }).lean() : [],
+        modifiedProductIds.main.size ? MainParentProduct.find({ _id: { $in: Array.from(modifiedProductIds.main) } }).lean() : []
+      ]);
+
+      const parentMap = new Map(freshParents.map(p => [p._id.toString(), p]));
+      const mainMap = new Map(freshMains.map(m => [m._id.toString(), m]));
+
+      const enrichedDetails = order.productDetails.map((detail) => {
+        const detailObj = detail.toObject();
+        let currentStock = 0;
+
+        if (detail.parentProductId) {
+          const p = parentMap.get(detail.parentProductId.toString());
+          const s = p?.stockByUnit?.find(u => u.unitId.toString() === unitId.toString());
+          currentStock = s?.availableToCommitPPQuantity || 0;
+        } else if (detail.mainParentId) {
+          const m = mainMap.get(detail.mainParentId.toString());
+          const s = m?.stockByUnit?.find(u => u.unitId.toString() === unitId.toString());
+          currentStock = s?.totalMPQuantity || 0;
+        }
+
+        return { ...detailObj, availableQuantity: currentStock };
+      });
+
+      return res.status(200).json({ 
+        message: "Assigned quantities updated successfully.", 
+        updatedProductDetails: enrichedDetails 
+      });
     }
-    throw new Error("No updates performed");
+
+    throw new Error("No products were updated.");
+
   } catch (error) {
-    await session.abortTransaction();
-    res.status(500).json({ message: error.message });
-  } finally {
+    if (session.inTransaction()) await session.abortTransaction();
     session.endSession();
+    return res.status(500).json({ message: error.message });
   }
 };
 
