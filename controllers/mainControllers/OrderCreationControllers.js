@@ -1194,7 +1194,7 @@ exports.updateAssignedQuantities = async (req, res) => {
           orderId: order._id, orderCode: order.orderCode, orderType: order.orderType, orderStatus: order.status,
           action: "Stock assigned", module: "Order", entityName: updatedDoc.mainParentProductName, entityCode: updatedDoc.mainParentProductCode,
           changeField: "assignedQuantity", oldValue: prevAssignedQty, activityValue: newAssignedQty, newValue: newAssignedQty,
-          description: `Assigned quantity ${newAssignedQty} of ${updatedDoc.mainParentProductName}. Stock before: ${stockBefore}, After: ${stockBefore - diff}`,
+          description: `Assigned quantity ${newAssignedQty} of ${updatedDoc.mainParentProductName}. Stock before: ${stockBefore}, After: ${stockBefore - diff} - Unit: ${user?.unitName}`,
           ipAddress: req.ip, userAgent: req.headers["user-agent"]
         });
       }
