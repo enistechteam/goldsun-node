@@ -746,90 +746,155 @@ const Logs = require("../../models/masterModels/Log");
 
 exports.createProductOutward = async (req, res) => {
   const session = await mongoose.startSession();
+  
   try {
     await session.withTransaction(async () => {
       const { fromUnitId, toUnitId, products, user } = req.body;
 
-      // 1. Basic Validation & Consolidation
-      if (!fromUnitId || !toUnitId || !products?.length) throw new Error('Missing required fields');
-      
-      const uniqueProducts = consolidateProducts(products); // Use your existing consolidation logic
+      // 1. Validation
+      if (!fromUnitId || !toUnitId || !products?.length) {
+        throw new Error('Missing required fields: fromUnitId, toUnitId, or products');
+      }
+      if (fromUnitId.toString() === toUnitId.toString()) {
+        throw new Error('From unit and to unit cannot be the same');
+      }
+
+      const [FromUnitDoc, ToUnitDoc] = await Promise.all([
+        Unit.findById(fromUnitId).session(session),
+        Unit.findById(toUnitId).session(session)
+      ]);
+      if (!FromUnitDoc || !ToUnitDoc) throw new Error('Invalid unit IDs');
+
+      // 2. Generate Codes (Preserving your exact logic)
+      const [lastOutward, lastInward] = await Promise.all([
+        ProductOutward.findOne({ outwardCode: { $regex: /^OUTW\d{7}$/ } }).sort({ outwardCode: -1 }).session(session),
+        ProductInward.findOne({ inwardCode: { $regex: /^INWD\d{7}$/ } }).sort({ inwardCode: -1 }).session(session)
+      ]);
+
+      const outwardCode = lastOutward ? `OUTW${(parseInt(lastOutward.outwardCode.slice(4)) + 1).toString().padStart(7, '0')}` : 'OUTW0000001';
+      const inwardCode = lastInward ? `INWD${(parseInt(lastInward.inwardCode.slice(4)) + 1).toString().padStart(7, '0')}` : 'INWD0000001';
+
+      // 3. Consolidate Products to prevent VersionError
+      const uniqueProducts = Object.values(products.reduce((acc, item) => {
+        const id = item.childProductId || item.parentProductId || item.mainParentId;
+        const key = `${item.productType}_${id}`;
+        if (!acc[key]) acc[key] = { ...item, quantity: Number(item.quantity) };
+        else acc[key].quantity += Number(item.quantity);
+        return acc, {};
+      }));
+
       const outwardDetails = [];
       const inwardDetails = [];
 
+      // 4. Atomic Product Loop
       for (const item of uniqueProducts) {
-        const { productType, childProductId, parentProductId, mainParentId, quantity } = item;
+        const { productType, childProductId, parentProductId, mainParentId, quantity, productTypeId } = item;
         const pId = childProductId || parentProductId || mainParentId;
 
-        // Define which model and fields to use
-        const config = getProductConfig(productType); 
-        
-        // ------------------------------------------------------------
-        // ATOMIC STEP 1: DEBIT FROM SOURCE UNIT
-        // ------------------------------------------------------------
+        // Configuration Mapping
+        const config = {
+          'Child Product': { model: ChildProduct, total: 'totalCPQuantity', avail: 'availableToCommitCPQuantity' },
+          'Parent Product': { model: ParentProduct, total: 'totalPPQuantity', avail: 'availableToCommitPPQuantity' },
+          'Main Parent': { model: MainParentProduct, total: 'totalMPQuantity', avail: 'availableToCommitMPQuantity' }
+        }[productType];
+
+        // --- ATOMIC DEBIT FROM SOURCE ---
         const fromDoc = await config.model.findOneAndUpdate(
-          { 
-            _id: pId, 
-            "stockByUnit.unitId": fromUnitId,
-            [`stockByUnit.${config.availableField}`]: { $gte: quantity } // SAFETY CHECK
-          },
-          { $inc: { [`stockByUnit.$.${config.totalField}`]: -quantity, [`stockByUnit.$.${config.availableField}`]: -quantity } },
+          { _id: pId, "stockByUnit.unitId": fromUnitId, [`stockByUnit.${config.avail}`]: { $gte: quantity } },
+          { $inc: { [`stockByUnit.$.${config.total}`]: -quantity, [`stockByUnit.$.${config.avail}`]: -quantity } },
           { session, new: false } // Get state BEFORE update for accurate logs
         );
 
-        if (!fromDoc) throw new Error(`Insufficient stock or product not found: ${pId}`);
-        
-        const fromStockObj = fromDoc.stockByUnit.find(s => s.unitId.toString() === fromUnitId.toString());
-        const fromOldQty = fromStockObj[config.availableField];
+        if (!fromDoc) throw new Error(`Insufficient stock for ${pId} in ${FromUnitDoc.UnitName}`);
 
-        // ------------------------------------------------------------
-        // ATOMIC STEP 2: CREDIT TO DESTINATION UNIT (with Upsert logic)
-        // ------------------------------------------------------------
+        const fromStockObj = fromDoc.stockByUnit.find(s => s.unitId.toString() === fromUnitId.toString());
+        const fromOldQty = fromStockObj[config.avail];
+        const fromNewQty = fromOldQty - quantity;
+
+        // --- ATOMIC CREDIT TO DESTINATION ---
         let toDoc = await config.model.findOneAndUpdate(
           { _id: pId, "stockByUnit.unitId": toUnitId },
-          { $inc: { [`stockByUnit.$.${config.totalField}`]: quantity, [`stockByUnit.$.${config.availableField}`]: quantity } },
+          { $inc: { [`stockByUnit.$.${config.total}`]: quantity, [`stockByUnit.$.${config.avail}`]: quantity } },
           { session, new: false }
         );
 
         let toOldQty = 0;
         if (!toDoc) {
-          // Unit entry doesn't exist, push it
-          const freshToDoc = await config.model.findByIdAndUpdate(
-            pId,
-            { $push: { stockByUnit: { unitId: toUnitId, [config.totalField.split('.').pop()]: quantity, [config.availableField.split('.').pop()]: quantity, committedMPQuantity: 0, committedPPQuantity: 0, committedCPQuantity: 0 } } },
-            { session, new: true }
+          // If unit doesn't exist, push it. This handles first-time transfers.
+          await config.model.updateOne(
+            { _id: pId },
+            { $push: { stockByUnit: { unitId: toUnitId, [config.total]: quantity, [config.avail]: quantity, committedMPQuantity: 0, committedPPQuantity: 0, committedCPQuantity: 0 } } },
+            { session }
           );
           toOldQty = 0;
         } else {
           const toStockObj = toDoc.stockByUnit.find(s => s.unitId.toString() === toUnitId.toString());
-          toOldQty = toStockObj[config.availableField] || 0;
+          toOldQty = toStockObj[config.avail] || 0;
+        }
+        const toNewQty = toOldQty + quantity;
+
+        // --- CONSTITUENT SYNC FOR MAIN PARENTS ---
+        if (productType === 'Main Parent') {
+          for (const pp of fromDoc.parentProducts) {
+            const reqQty = pp.quantity * quantity;
+            // Atomic Debit Parent Source
+            await ParentProduct.updateOne(
+              { _id: pp.parentProductId, "stockByUnit.unitId": fromUnitId },
+              { $inc: { "stockByUnit.$.totalPPQuantity": -reqQty, "stockByUnit.$.availableToCommitPPQuantity": -reqQty } },
+              { session }
+            );
+            // Atomic Credit Parent Dest
+            const ppDest = await ParentProduct.updateOne(
+              { _id: pp.parentProductId, "stockByUnit.unitId": toUnitId },
+              { $inc: { "stockByUnit.$.totalPPQuantity": reqQty, "stockByUnit.$.availableToCommitPPQuantity": reqQty } },
+              { session }
+            );
+            if (ppDest.modifiedCount === 0) {
+              await ParentProduct.updateOne({ _id: pp.parentProductId }, { $push: { stockByUnit: { unitId: toUnitId, totalPPQuantity: reqQty, availableToCommitPPQuantity: reqQty, committedPPQuantity: 0 } } }, { session });
+            }
+          }
         }
 
-        // ------------------------------------------------------------
-        // ATOMIC STEP 3: CASCADE & RECALCULATE
-        // ------------------------------------------------------------
-        if (productType === 'Main Parent') {
-          // Add logic to atomic-update constituent parents (similar to Debit/Credit above)
-        }
-        
-        // Use the BULK recalculate function we created earlier
+        // --- RECALCULATE ---
         await recalculateMainParentsForParent(parentProductId || pId, fromUnitId, session);
         await recalculateMainParentsForParent(parentProductId || pId, toUnitId, session);
 
-        // Prepare Details for Logs & Records
-        const detail = { ...item, fromOldQuantity: fromOldQty, fromNewQuantity: fromOldQty - quantity, toOldQuantity: toOldQty, toNewQuantity: toOldQty + quantity };
-        outwardDetails.push(detail);
-        inwardDetails.push(detail);
+        // --- PREPARE LOG DATA & RECORDS ---
+        const detailItem = { ...item, fromOldQuantity: fromOldQty, fromNewQuantity: fromNewQty, toOldQuantity: toOldQty, toNewQuantity: toNewQty };
+        outwardDetails.push(detailItem);
+        inwardDetails.push(detailItem);
 
-        // CREATE LOGS HERE (Using ActivityLog.logCreate as you did before)
+        const entityName = fromDoc.childProductName || fromDoc.parentProductName || fromDoc.mainParentProductName;
+
+        // ACTIVITY LOGS (Using your exact existing logic/descriptions)
+        await ActivityLog.logCreate({
+          employeeId: user?.employeeId, employeeCode: user?.employeeCode, employeeName: user?.employeeName,
+          unitId: fromUnitId, unitName: user?.unitName, childProductId, parentProductId, mainParentId,
+          orderCode: outwardCode, orderType: "ProductOutward", action: "Outwards", module: "Product Outward",
+          entityName, changeField: config.avail, oldValue: fromOldQty, activityValue: quantity, newValue: fromNewQty,
+          description: `Outwarded ${quantity} units of ${entityName} from ${FromUnitDoc.UnitName} to ${ToUnitDoc.UnitName}, current Stock in ${FromUnitDoc.UnitName} - ${fromNewQty}, current stock in ${ToUnitDoc.UnitName} - ${toNewQty} `,
+          ipAddress: req.ip, userAgent: req.headers["user-agent"]
+        }, { session });
+
+        await ActivityLog.logCreate({
+          employeeId: user?.employeeId, unitId: toUnitId, childProductId, parentProductId, mainParentId,
+          orderCode: inwardCode, orderType: "ProductInward", action: "Inwards", module: "Product Inward",
+          entityName, oldvalue: toOldQty, activityValue: quantity, newValue: toNewQty,
+          description: `Inwarded ${quantity} units of ${entityName} from ${FromUnitDoc.UnitName} to ${ToUnitDoc.UnitName}, current Stock in ${FromUnitDoc.UnitName} - ${fromNewQty}, current stock in ${ToUnitDoc.UnitName} - ${toNewQty}`,
+          ipAddress: req.ip, userAgent: req.headers["user-agent"]
+        }, { session });
       }
 
-      // 4. Save Inward/Outward Records
-      // ... same as your current code ...
+      // 5. Final Records
+      const [savedOutward, savedInward] = await Promise.all([
+        new ProductOutward({ outwardCode, fromUnitId, toUnitId, ownerUnitId: fromUnitId, outwardDateTime: new Date(), productDetails: outwardDetails, createdBy: user?.employeeId }).save({ session }),
+        new ProductInward({ inwardCode, fromUnitId, toUnitId, ownerUnitId: toUnitId, inwardDateTime: new Date(), productDetails: inwardDetails, createdBy: user?.employeeId }).save({ session })
+      ]);
 
+      res.status(201).json({ success: true, data: { outward: savedOutward, inward: savedInward } });
     });
-    res.status(201).json({ success: true, message: 'Transfer successful' });
   } catch (error) {
+    console.error('Outward Transaction Failed:', error.message);
     res.status(400).json({ success: false, message: error.message });
   } finally {
     await session.endSession();
