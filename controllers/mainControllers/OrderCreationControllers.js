@@ -1136,13 +1136,19 @@ exports.updateAssignedQuantities = async (req, res) => {
         await recalculateMainParentsForParent(parentProductId, unitId, session);
         
         logsToCreate.push({
-          employeeId: user?.employeeId, employeeCode: user?.employeeCode, employeeName: user?.employeeName,
-          departmentId: user?.departmentId, departmentName: user?.departmentName, role: user?.role,
-          unitId, unitName: user?.unitName, customerID: order.customerId, parentProductId,
+          employeeId: user?.employeeId, employeeCode: user?.employeeCode,
+          employeeName: user?.employeeName,
+          departmentId: user?.departmentId,
+          departmentName: user?.departmentName, 
+          role: user?.role,
+          unitId, 
+          unitName: user?.unitName, 
+          customerID: order.customerId, 
+          parentProductId,
           orderId: order._id, orderCode: order.orderCode, orderType: order.orderType, orderStatus: order.status,
           action: "Stock assigned", module: "Order", entityName: updatedDoc.parentProductName, entityCode: updatedDoc.parentProductCode,
           changeField: "assignedQuantity", oldValue: prevAssignedQty, activityValue: newAssignedQty, newValue: newAssignedQty,
-          description: `Assigned quantity ${newAssignedQty} of ${updatedDoc.parentProductName} in ${order.orderCode}. Stock before: ${stockBefore}, After: ${stockAfter}`,
+          description: `Assigned quantity ${newAssignedQty} of ${updatedDoc.parentProductName} in ${order.orderCode}. Stock before: ${stockBefore}, After: ${stockAfter} - Unit: ${user?.unitName}`,
           ipAddress: req.ip, userAgent: req.headers["user-agent"]
         });
       }
