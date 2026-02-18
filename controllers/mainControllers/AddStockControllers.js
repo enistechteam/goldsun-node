@@ -561,8 +561,37 @@ exports.adjustStock = async (req, res) => {
   session.startTransaction();
   try {
     const { unitId, productid, quantity, productType, Reason, Description, user } = req.body;
-    // ... (Keep your switch/case for model, totalField, availableField) ...
 
+     if (!unitId || !productid || !quantity || !productType) {
+      throw new Error("Missing required fields.");
+    }
+
+    let model, totalField, availableField, nameField, codeField;
+    switch (productType) {
+      case "Child Product":
+        model = ChildProduct;
+        totalField = "totalCPQuantity";
+        availableField = "availableToCommitCPQuantity";
+        nameField = "childProductName"; codeField = "childProductCode";
+        break;
+      case "Parent Product":
+        model = ParentProduct;
+        totalField = "totalPPQuantity";
+        availableField = "availableToCommitPPQuantity";
+        nameField = "parentProductName"; codeField = "parentProductCode";
+        break;
+      case "Main Parent":
+        model = MainParent;
+        totalField = "totalMPQuantity";
+        availableField = "availableToCommitMPQuantity";
+        nameField = "mainParentProductName"; codeField = "mainParentProductCode";
+        break;
+      default:
+        throw new Error("Invalid product type.");
+    }
+
+    // 1. ATOMIC ADJUSTMENT (Primary Product)
+    
     const updatedDoc = await model.findOneAndUpdate(
       { 
         _id: productid, 
