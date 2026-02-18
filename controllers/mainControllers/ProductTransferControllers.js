@@ -744,37 +744,194 @@ const Logs = require("../../models/masterModels/Log");
 //   }
 // };
 
+// exports.createProductOutward = async (req, res) => {
+//   const session = await mongoose.startSession();
+  
+//   try {
+//     await session.withTransaction(async () => {
+//       const { fromUnitId, toUnitId, products, user } = req.body;
+
+//       // 1. Validation & Consolidation
+//       if (!fromUnitId || !toUnitId || !products?.length) {
+//         throw new Error('Missing required fields');
+//       }
+//       if (fromUnitId.toString() === toUnitId.toString()) {
+//         throw new Error('From unit and to unit cannot be the same');
+//       }
+
+//       const [FromUnitDoc, ToUnitDoc] = await Promise.all([
+//         Unit.findById(fromUnitId).session(session),
+//         Unit.findById(toUnitId).session(session)
+//       ]);
+//       if (!FromUnitDoc || !ToUnitDoc) throw new Error('Invalid unit IDs');
+
+//       // 2. Generate Codes
+//       const [lastOutward, lastInward] = await Promise.all([
+//         ProductOutward.findOne({ outwardCode: { $regex: /^OUTW\d{7}$/ } }).sort({ outwardCode: -1 }).session(session),
+//         ProductInward.findOne({ inwardCode: { $regex: /^INWD\d{7}$/ } }).sort({ inwardCode: -1 }).session(session)
+//       ]);
+
+//       const outwardCode = lastOutward ? `OUTW${(parseInt(lastOutward.outwardCode.slice(4)) + 1).toString().padStart(7, '0')}` : 'OUTW0000001';
+//       const inwardCode = lastInward ? `INWD${(parseInt(lastInward.inwardCode.slice(4)) + 1).toString().padStart(7, '0')}` : 'INWD0000001';
+
+//       // 3. Consolidate Products
+//       const consolidated = products.reduce((acc, item) => {
+//         const id = item.childProductId || item.parentProductId || item.mainParentId;
+//         const key = `${item.productType}_${id}`;
+//         if (!acc[key]) acc[key] = { ...item, quantity: Number(item.quantity) };
+//         else acc[key].quantity += Number(item.quantity);
+//         return acc;
+//       }, {});
+      
+//       const uniqueProducts = Object.values(consolidated);
+//       const outwardDetails = [];
+//       const inwardDetails = [];
+
+//       // 4. Atomic Product Loop
+//       for (const item of uniqueProducts) {
+//         const { productType, childProductId, parentProductId, mainParentId, quantity, productTypeId } = item;
+//         const pId = childProductId || parentProductId || mainParentId;
+//         const normalizedType = productType ? productType.trim() : "";
+        
+//         const configMap = {
+//           'Child Product': { model: ChildProduct, total: 'totalCPQuantity', avail: 'availableToCommitCPQuantity' },
+//           'Parent Product': { model: ParentProduct, total: 'totalPPQuantity', avail: 'availableToCommitPPQuantity' },
+//           'Main Parent': { model: MainParentProduct, total: 'totalMPQuantity', avail: 'totalMPQuantity' }
+//         };
+
+//         const config = configMap[normalizedType];
+//         if (!config) throw new Error(`Model not defined for: "${normalizedType}"`);
+
+//         // --- ATOMIC DEBIT FROM SOURCE ---
+//         const fromDoc = await config.model.findOneAndUpdate(
+//           { 
+//             _id: pId, 
+//             "stockByUnit.unitId": fromUnitId, 
+//             [`stockByUnit.${config.avail}`]: { $gte: quantity } 
+//           },
+//           { $inc: { [`stockByUnit.$.${config.total}`]: -quantity, [`stockByUnit.$.${config.avail}`]: -quantity } },
+//           { session, new: false }
+//         );
+
+//         if (!fromDoc) throw new Error(`Insufficient stock for ${pId} in ${FromUnitDoc.UnitName}`);
+
+//         const fromStockObj = fromDoc.stockByUnit.find(s => s.unitId.toString() === fromUnitId.toString());
+//         const fromOldQty = fromStockObj[config.avail];
+//         const fromNewQty = fromOldQty - quantity;
+
+//         // --- ATOMIC CREDIT TO DESTINATION ---
+//         let toDoc = await config.model.findOneAndUpdate(
+//           { _id: pId, "stockByUnit.unitId": toUnitId },
+//           { $inc: { [`stockByUnit.$.${config.total}`]: quantity, [`stockByUnit.$.${config.avail}`]: quantity } },
+//           { session, new: false }
+//         );
+
+//         let toOldQty = 0;
+//         if (!toDoc) {
+//           await config.model.updateOne(
+//             { _id: pId },
+//             { $push: { stockByUnit: { unitId: toUnitId, [config.total]: quantity, [config.avail]: quantity, committedMPQuantity: 0, committedPPQuantity: 0, committedCPQuantity: 0 } } },
+//             { session }
+//           );
+//         } else {
+//           const toStockObj = toDoc.stockByUnit.find(s => s.unitId.toString() === toUnitId.toString());
+//           toOldQty = toStockObj[config.avail] || 0;
+//         }
+//         const toNewQty = toOldQty + quantity;
+
+//         // --- CONSTITUENT SYNC (ONLY FOR MAIN PARENTS) ---
+//         // This is the missing piece that handles the "Parent Products" inside a Main Parent
+//         if (normalizedType === 'Main Parent' && fromDoc.parentProducts?.length > 0) {
+//           for (const configItem of fromDoc.parentProducts) {
+//             const reqQty = quantity * configItem.quantity;
+//             const ppId = configItem.parentProductId;
+
+//             // Debit Parent at Source
+//             await ParentProduct.updateOne(
+//               { _id: ppId, "stockByUnit.unitId": fromUnitId },
+//               { $inc: { "stockByUnit.$.totalPPQuantity": -reqQty, "stockByUnit.$.availableToCommitPPQuantity": -reqQty } },
+//               { session }
+//             );
+
+//             // Credit Parent at Destination
+//             const ppDestUpdate = await ParentProduct.updateOne(
+//               { _id: ppId, "stockByUnit.unitId": toUnitId },
+//               { $inc: { "stockByUnit.$.totalPPQuantity": reqQty, "stockByUnit.$.availableToCommitPPQuantity": reqQty } },
+//               { session }
+//             );
+
+//             // If destination doesn't have the parent record, push it
+//             if (ppDestUpdate.modifiedCount === 0) {
+//               await ParentProduct.updateOne(
+//                 { _id: ppId },
+//                 { $push: { stockByUnit: { unitId: toUnitId, totalPPQuantity: reqQty, availableToCommitPPQuantity: reqQty, committedPPQuantity: 0 } } },
+//                 { session }
+//               );
+//             }
+//           }
+//         }
+
+//         // --- RECALCULATE ---
+//         await recalculateMainParentsForParent(parentProductId || pId, fromUnitId, session);
+//         await recalculateMainParentsForParent(parentProductId || pId, toUnitId, session);
+
+//         // 5. Prepare Logs
+//         const detailItem = { productTypeId, childProductId, parentProductId, mainParentId, quantity, fromOldQuantity: fromOldQty, fromNewQuantity: fromNewQty, toOldQuantity: toOldQty, toNewQuantity: toNewQty };
+//         outwardDetails.push(detailItem);
+//         inwardDetails.push(detailItem);
+
+//         const entityName = fromDoc.childProductName || fromDoc.parentProductName || fromDoc.mainParentProductName;
+//         const entityCode = fromDoc.childProductCode || fromDoc.parentProductCode || fromDoc.mainParentProductCode;
+
+//         await ActivityLog.logCreate({
+//           employeeId: user?.employeeId,employeeName: user?.employeeName,employeeCode: user?.employeeCode, unitId: fromUnitId, childProductId, parentProductId, mainParentId, entityCode,
+//           orderCode: outwardCode, orderType: "ProductOutward", action: "Outwards", module: "Product Outward",
+//           entityName, changeField: config.avail, oldValue: fromOldQty, activityValue: quantity, newValue: fromNewQty,
+//           description: `Outwarded ${quantity} units of ${entityName} from ${FromUnitDoc.UnitName} to ${ToUnitDoc.UnitName}. Stock: ${fromOldQty}->${fromNewQty}`,
+//           ipAddress: req.ip, userAgent: req.headers["user-agent"]
+//         }, { session });
+
+//         await ActivityLog.logCreate({
+//           employeeId: user?.employeeId,employeeName: user?.employeeName,employeeCode: user?.employeeCode, unitId: toUnitId, childProductId, parentProductId, mainParentId, entityCode,
+//           orderCode: inwardCode, orderType: "ProductInward", action: "Inwards", module: "Product Inward",
+//           entityName, oldValue: toOldQty, activityValue: quantity, newValue: toNewQty,
+//           description: `Inwarded ${quantity} units of ${entityName} to ${ToUnitDoc.UnitName}. Stock: ${toOldQty}->${toNewQty}`,
+//           ipAddress: req.ip, userAgent: req.headers["user-agent"]
+//         }, { session });
+//       }
+
+//       // 6. Final Records
+//       await Promise.all([
+//         new ProductOutward({ outwardCode, fromUnitId, toUnitId, ownerUnitId: fromUnitId, outwardDateTime: new Date(), productDetails: outwardDetails, createdBy: user?.employeeId }).save({ session }),
+//         new ProductInward({ inwardCode, fromUnitId, toUnitId, ownerUnitId: toUnitId, inwardDateTime: new Date(), productDetails: inwardDetails, createdBy: user?.employeeId }).save({ session })
+//       ]);
+
+//       res.status(201).json({ success: true, outwardCode, inwardCode });
+//     });
+//   } catch (error) {
+//     res.status(400).json({ success: false, message: error.message });
+//   } finally {
+//     await session.endSession();
+//   }
+// };
+
 exports.createProductOutward = async (req, res) => {
   const session = await mongoose.startSession();
-  
   try {
     await session.withTransaction(async () => {
       const { fromUnitId, toUnitId, products, user } = req.body;
 
-      // 1. Validation & Consolidation
-      if (!fromUnitId || !toUnitId || !products?.length) {
-        throw new Error('Missing required fields');
-      }
-      if (fromUnitId.toString() === toUnitId.toString()) {
-        throw new Error('From unit and to unit cannot be the same');
-      }
+      console.log("--- 🚀 STARTING OUTWARD TRANSACTION ---");
 
-      const [FromUnitDoc, ToUnitDoc] = await Promise.all([
-        Unit.findById(fromUnitId).session(session),
-        Unit.findById(toUnitId).session(session)
-      ]);
-      if (!FromUnitDoc || !ToUnitDoc) throw new Error('Invalid unit IDs');
-
-      // 2. Generate Codes
+      //       // 2. Generate Codes
       const [lastOutward, lastInward] = await Promise.all([
         ProductOutward.findOne({ outwardCode: { $regex: /^OUTW\d{7}$/ } }).sort({ outwardCode: -1 }).session(session),
         ProductInward.findOne({ inwardCode: { $regex: /^INWD\d{7}$/ } }).sort({ inwardCode: -1 }).session(session)
       ]);
 
-      const outwardCode = lastOutward ? `OUTW${(parseInt(lastOutward.outwardCode.slice(4)) + 1).toString().padStart(7, '0')}` : 'OUTW0000001';
+        const outwardCode = lastOutward ? `OUTW${(parseInt(lastOutward.outwardCode.slice(4)) + 1).toString().padStart(7, '0')}` : 'OUTW0000001';
       const inwardCode = lastInward ? `INWD${(parseInt(lastInward.inwardCode.slice(4)) + 1).toString().padStart(7, '0')}` : 'INWD0000001';
-
-      // 3. Consolidate Products
+            // 3. Consolidate Products
       const consolidated = products.reduce((acc, item) => {
         const id = item.childProductId || item.parentProductId || item.mainParentId;
         const key = `${item.productType}_${id}`;
@@ -782,45 +939,36 @@ exports.createProductOutward = async (req, res) => {
         else acc[key].quantity += Number(item.quantity);
         return acc;
       }, {});
-      
-      const uniqueProducts = Object.values(consolidated);
+
+          const uniqueProducts = Object.values(consolidated);
       const outwardDetails = [];
       const inwardDetails = [];
 
-      // 4. Atomic Product Loop
       for (const item of uniqueProducts) {
-        const { productType, childProductId, parentProductId, mainParentId, quantity, productTypeId } = item;
+        const { productType, childProductId, parentProductId, mainParentId, quantity } = item;
         const pId = childProductId || parentProductId || mainParentId;
-        const normalizedType = productType ? productType.trim() : "";
-        
+        const normalizedType = productType.trim();
+
         const configMap = {
-          'Child Product': { model: ChildProduct, total: 'totalCPQuantity', avail: 'availableToCommitCPQuantity' },
-          'Parent Product': { model: ParentProduct, total: 'totalPPQuantity', avail: 'availableToCommitPPQuantity' },
-          'Main Parent': { model: MainParentProduct, total: 'totalMPQuantity', avail: 'totalMPQuantity' }
+          'Child Product': { model: ChildProduct, avail: 'availableToCommitCPQuantity', total: 'totalCPQuantity' },
+          'Parent Product': { model: ParentProduct, avail: 'availableToCommitPPQuantity', total: 'totalPPQuantity' },
+          'Main Parent': { model: MainParentProduct, avail: 'totalMPQuantity', total: 'totalMPQuantity' }
         };
-
         const config = configMap[normalizedType];
-        if (!config) throw new Error(`Model not defined for: "${normalizedType}"`);
 
-        // --- ATOMIC DEBIT FROM SOURCE ---
+        // 1. DEBIT SOURCE
         const fromDoc = await config.model.findOneAndUpdate(
-          { 
-            _id: pId, 
-            "stockByUnit.unitId": fromUnitId, 
-            [`stockByUnit.${config.avail}`]: { $gte: quantity } 
-          },
+          { _id: pId, "stockByUnit.unitId": fromUnitId, [`stockByUnit.${config.avail}`]: { $gte: quantity } },
           { $inc: { [`stockByUnit.$.${config.total}`]: -quantity, [`stockByUnit.$.${config.avail}`]: -quantity } },
           { session, new: false }
         );
-
-        if (!fromDoc) throw new Error(`Insufficient stock for ${pId} in ${FromUnitDoc.UnitName}`);
-
-        const fromStockObj = fromDoc.stockByUnit.find(s => s.unitId.toString() === fromUnitId.toString());
+        if (!fromDoc) throw new Error(`Insufficient stock for ${pId}`);
+        
+        const fromStockBefore = fromDoc.stockByUnit.find(s => s.unitId.toString() === fromUnitId.toString())[config.avail];
+  const fromStockObj = fromDoc.stockByUnit.find(s => s.unitId.toString() === fromUnitId.toString());
         const fromOldQty = fromStockObj[config.avail];
-        const fromNewQty = fromOldQty - quantity;
-
-        // --- ATOMIC CREDIT TO DESTINATION ---
-        let toDoc = await config.model.findOneAndUpdate(
+        // 2. CREDIT DESTINATION
+        const toDoc = await config.model.findOneAndUpdate(
           { _id: pId, "stockByUnit.unitId": toUnitId },
           { $inc: { [`stockByUnit.$.${config.total}`]: quantity, [`stockByUnit.$.${config.avail}`]: quantity } },
           { session, new: false }
@@ -830,55 +978,61 @@ exports.createProductOutward = async (req, res) => {
         if (!toDoc) {
           await config.model.updateOne(
             { _id: pId },
-            { $push: { stockByUnit: { unitId: toUnitId, [config.total]: quantity, [config.avail]: quantity, committedMPQuantity: 0, committedPPQuantity: 0, committedCPQuantity: 0 } } },
+            { $push: { stockByUnit: { unitId: toUnitId, [config.total]: quantity, [config.avail]: quantity, committedMPQuantity: 0 } } },
             { session }
           );
         } else {
           const toStockObj = toDoc.stockByUnit.find(s => s.unitId.toString() === toUnitId.toString());
           toOldQty = toStockObj[config.avail] || 0;
         }
-        const toNewQty = toOldQty + quantity;
 
-        // --- CONSTITUENT SYNC (ONLY FOR MAIN PARENTS) ---
-        // This is the missing piece that handles the "Parent Products" inside a Main Parent
+        // 3. CONSTITUENT SYNC & RECALCULATE
         if (normalizedType === 'Main Parent' && fromDoc.parentProducts?.length > 0) {
-          for (const configItem of fromDoc.parentProducts) {
-            const reqQty = quantity * configItem.quantity;
-            const ppId = configItem.parentProductId;
+          for (const cp of fromDoc.parentProducts) {
+            const reqQty = quantity * cp.quantity;
+            const ppId = cp.parentProductId;
 
-            // Debit Parent at Source
+            // Update Parent Stocks
             await ParentProduct.updateOne(
               { _id: ppId, "stockByUnit.unitId": fromUnitId },
               { $inc: { "stockByUnit.$.totalPPQuantity": -reqQty, "stockByUnit.$.availableToCommitPPQuantity": -reqQty } },
               { session }
             );
 
-            // Credit Parent at Destination
             const ppDestUpdate = await ParentProduct.updateOne(
               { _id: ppId, "stockByUnit.unitId": toUnitId },
               { $inc: { "stockByUnit.$.totalPPQuantity": reqQty, "stockByUnit.$.availableToCommitPPQuantity": reqQty } },
               { session }
             );
 
-            // If destination doesn't have the parent record, push it
-            if (ppDestUpdate.modifiedCount === 0) {
+            if (ppDestUpdate.matchedCount === 0) {
               await ParentProduct.updateOne(
                 { _id: ppId },
                 { $push: { stockByUnit: { unitId: toUnitId, totalPPQuantity: reqQty, availableToCommitPPQuantity: reqQty, committedPPQuantity: 0 } } },
                 { session }
               );
             }
+
+            // FIXED: RECALCULATE FOR THE PARENT ID, NOT THE MAIN PARENT ID
+            console.log(`🔄 Triggering Recalculate for Parent: ${ppId}`);
+            await recalculateMainParentsForParent(ppId, fromUnitId, session);
+            await recalculateMainParentsForParent(ppId, toUnitId, session);
           }
+        } else {
+          // If it's a direct Parent Product movement
+          await recalculateMainParentsForParent(pId, fromUnitId, session);
+          await recalculateMainParentsForParent(pId, toUnitId, session);
         }
 
-        // --- RECALCULATE ---
-        await recalculateMainParentsForParent(parentProductId || pId, fromUnitId, session);
-        await recalculateMainParentsForParent(parentProductId || pId, toUnitId, session);
-
-        // 5. Prepare Logs
-        const detailItem = { productTypeId, childProductId, parentProductId, mainParentId, quantity, fromOldQuantity: fromOldQty, fromNewQuantity: fromNewQty, toOldQuantity: toOldQty, toNewQuantity: toNewQty };
-        outwardDetails.push(detailItem);
-        inwardDetails.push(detailItem);
+        // 4. LOGGING (Using the calculated numbers to ensure accuracy)
+        const fromNewQty = fromStockBefore - quantity;
+        const toNewQty = toOldQty + quantity;
+         const [FromUnitDoc, ToUnitDoc] = await Promise.all([
+        Unit.findById(fromUnitId).session(session),
+        Unit.findById(toUnitId).session(session)
+      ]);
+      
+      if (!FromUnitDoc || !ToUnitDoc) throw new Error('Invalid unit IDs');
 
         const entityName = fromDoc.childProductName || fromDoc.parentProductName || fromDoc.mainParentProductName;
         const entityCode = fromDoc.childProductCode || fromDoc.parentProductCode || fromDoc.mainParentProductCode;
@@ -899,15 +1053,8 @@ exports.createProductOutward = async (req, res) => {
           ipAddress: req.ip, userAgent: req.headers["user-agent"]
         }, { session });
       }
-
-      // 6. Final Records
-      await Promise.all([
-        new ProductOutward({ outwardCode, fromUnitId, toUnitId, ownerUnitId: fromUnitId, outwardDateTime: new Date(), productDetails: outwardDetails, createdBy: user?.employeeId }).save({ session }),
-        new ProductInward({ inwardCode, fromUnitId, toUnitId, ownerUnitId: toUnitId, inwardDateTime: new Date(), productDetails: inwardDetails, createdBy: user?.employeeId }).save({ session })
-      ]);
-
-      res.status(201).json({ success: true, outwardCode, inwardCode });
     });
+    res.status(201).json({ success: true });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
   } finally {
@@ -1564,81 +1711,191 @@ exports.getInwardsByDate = async (req, res) => {
   }
 };
 
+// async function recalculateMainParentsForParent(parentProductId, unitId, session = null) {
+//   const unitIdStr = unitId.toString();
+
+//   // 1. Find all Main Parents depending on this Parent Product
+//   const mainParents = await MainParentProduct.find({
+//     "parentProducts.parentProductId": parentProductId
+//   }).session(session).lean();
+
+//   if (!mainParents.length) return;
+
+//   // 2. Fetch all necessary Parent Products to calculate the "bottleneck"
+//   const parentProductIds = new Set();
+//   mainParents.forEach(mp => {
+//     mp.parentProducts?.forEach(config => {
+//       if (config.parentProductId) parentProductIds.add(config.parentProductId.toString());
+//     });
+//   });
+
+//   const parentProducts = await ParentProduct.find({
+//     _id: { $in: Array.from(parentProductIds) }
+//   }).session(session).lean();
+
+//   const ppMap = new Map(parentProducts.map(pp => [pp._id.toString(), pp]));
+
+//   for (const mp of mainParents) {
+//     let minPossibleUnits = Infinity;
+//     const requiredParents = mp.parentProducts || [];
+
+//     // Calculate buildable quantity
+//     for (const config of requiredParents) {
+//       const pp = ppMap.get(config.parentProductId?.toString());
+//       const requiredQtyPerMP = Number(config.quantity) || 1;
+      
+//       // Find stock for specific unit in the constituent Parent Product
+//       const stockRecord = pp?.stockByUnit?.find(s => s.unitId?.toString() === unitIdStr);
+//       const availableQty = Number(stockRecord?.availableToCommitPPQuantity) || 0;
+      
+//       const possible = Math.floor(availableQty / requiredQtyPerMP);
+//       if (possible < minPossibleUnits) minPossibleUnits = possible;
+//     }
+
+//     const finalBuildableQty = minPossibleUnits === Infinity ? 0 : Math.max(0, minPossibleUnits);
+
+//     // 3. ATOMIC UPSERT LOGIC
+//     // First, try to update the existing unit entry
+//     const updateResult = await MainParentProduct.updateOne(
+//       { 
+//         _id: mp._id, 
+//         "stockByUnit.unitId": unitId 
+//       },
+//       { 
+//         $set: { 
+//           "stockByUnit.$.totalMPQuantity": finalBuildableQty,
+//           "stockByUnit.$.availableToCommitMPQuantity": finalBuildableQty 
+//         } 
+//       },
+//       { session }
+//     );
+
+//     // If no unit entry existed (modifiedCount === 0), push a new one
+//     if (updateResult.matchedCount === 0) {
+//       await MainParentProduct.updateOne(
+//         { _id: mp._id },
+//         { 
+//           $push: { 
+//             stockByUnit: { 
+//               unitId: unitId, 
+//               totalMPQuantity: finalBuildableQty,
+//               availableToCommitMPQuantity: finalBuildableQty,
+//               committedMPQuantity: 0
+//             } 
+//           } 
+//         },
+//         { session }
+//       );
+//     }
+//   }
+// }
+
 async function recalculateMainParentsForParent(parentProductId, unitId, session = null) {
   const unitIdStr = unitId.toString();
+  console.log(`\n--- 🔄 RECALCULATE START [ParentID: ${parentProductId} | Unit: ${unitIdStr}] ---`);
 
-  // 1. Find all Main Parents depending on this Parent Product
-  const mainParents = await MainParentProduct.find({
-    "parentProducts.parentProductId": parentProductId
-  }).session(session).lean();
+  try {
+    // 1. Find all Main Parents depending on this Parent Product
+    const mainParents = await MainParentProduct.find({
+      "parentProducts.parentProductId": parentProductId
+    }).session(session).lean();
 
-  if (!mainParents.length) return;
-
-  // 2. Fetch all necessary Parent Products to calculate the "bottleneck"
-  const parentProductIds = new Set();
-  mainParents.forEach(mp => {
-    mp.parentProducts?.forEach(config => {
-      if (config.parentProductId) parentProductIds.add(config.parentProductId.toString());
-    });
-  });
-
-  const parentProducts = await ParentProduct.find({
-    _id: { $in: Array.from(parentProductIds) }
-  }).session(session).lean();
-
-  const ppMap = new Map(parentProducts.map(pp => [pp._id.toString(), pp]));
-
-  for (const mp of mainParents) {
-    let minPossibleUnits = Infinity;
-    const requiredParents = mp.parentProducts || [];
-
-    // Calculate buildable quantity
-    for (const config of requiredParents) {
-      const pp = ppMap.get(config.parentProductId?.toString());
-      const requiredQtyPerMP = Number(config.quantity) || 1;
-      
-      // Find stock for specific unit in the constituent Parent Product
-      const stockRecord = pp?.stockByUnit?.find(s => s.unitId?.toString() === unitIdStr);
-      const availableQty = Number(stockRecord?.availableToCommitPPQuantity) || 0;
-      
-      const possible = Math.floor(availableQty / requiredQtyPerMP);
-      if (possible < minPossibleUnits) minPossibleUnits = possible;
+    if (!mainParents.length) {
+      console.log(`ℹ️  No Main Parents found referencing this Parent Product.`);
+      return;
     }
 
-    const finalBuildableQty = minPossibleUnits === Infinity ? 0 : Math.max(0, minPossibleUnits);
+    console.log(`📝 Found ${mainParents.length} Main Parent(s) to recalculate.`);
 
-    // 3. ATOMIC UPSERT LOGIC
-    // First, try to update the existing unit entry
-    const updateResult = await MainParentProduct.updateOne(
-      { 
-        _id: mp._id, 
-        "stockByUnit.unitId": unitId 
-      },
-      { 
-        $set: { 
-          "stockByUnit.$.totalMPQuantity": finalBuildableQty,
-          "stockByUnit.$.availableToCommitMPQuantity": finalBuildableQty 
-        } 
-      },
-      { session }
-    );
+    // 2. Fetch all necessary Parent Products to calculate the "bottleneck"
+    const parentProductIds = new Set();
+    mainParents.forEach(mp => {
+      mp.parentProducts?.forEach(config => {
+        if (config.parentProductId) parentProductIds.add(config.parentProductId.toString());
+      });
+    });
 
-    // If no unit entry existed (modifiedCount === 0), push a new one
-    if (updateResult.matchedCount === 0) {
-      await MainParentProduct.updateOne(
-        { _id: mp._id },
+    const parentProducts = await ParentProduct.find({
+      _id: { $in: Array.from(parentProductIds) }
+    }).session(session).lean();
+
+    const ppMap = new Map(parentProducts.map(pp => [pp._id.toString(), pp]));
+
+    for (const mp of mainParents) {
+      console.log(`   🔎 Recalculating: ${mp.mainParentProductName} (${mp._id})`);
+      
+      let minPossibleUnits = Infinity;
+      const requiredParents = mp.parentProducts || [];
+
+      if (requiredParents.length === 0) {
+        console.log(`   ⚠️  MP has no constituent parent products configured.`);
+        minPossibleUnits = 0;
+      }
+
+      // Calculate buildable quantity
+      for (const config of requiredParents) {
+        const ppId = config.parentProductId?.toString();
+        const pp = ppMap.get(ppId);
+        const requiredQtyPerMP = Number(config.quantity) || 1;
+        
+        // Find stock for specific unit in the constituent Parent Product
+        const stockRecord = pp?.stockByUnit?.find(s => s.unitId?.toString() === unitIdStr);
+        const availableQty = Number(stockRecord?.availableToCommitPPQuantity) || 0;
+        
+        const possible = Math.floor(availableQty / requiredQtyPerMP);
+        
+        console.log(`      -> Part: ${pp?.parentProductName || ppId}`);
+        console.log(`         [DB State] Avail: ${availableQty} | Needs: ${requiredQtyPerMP} | Buildable: ${possible}`);
+
+        if (possible < minPossibleUnits) {
+          minPossibleUnits = possible;
+        }
+      }
+
+      const finalBuildableQty = minPossibleUnits === Infinity ? 0 : Math.max(0, minPossibleUnits);
+      console.log(`   ✅ FINAL CALCULATION for ${mp.mainParentProductName}: ${finalBuildableQty}`);
+
+      // 3. ATOMIC UPSERT LOGIC
+      // First, try to update the existing unit entry
+      const updateResult = await MainParentProduct.updateOne(
         { 
-          $push: { 
-            stockByUnit: { 
-              unitId: unitId, 
-              totalMPQuantity: finalBuildableQty,
-              availableToCommitMPQuantity: finalBuildableQty,
-              committedMPQuantity: 0
-            } 
+          _id: mp._id, 
+          "stockByUnit.unitId": unitId 
+        },
+        { 
+          $set: { 
+            "stockByUnit.$.totalMPQuantity": finalBuildableQty,
+            "stockByUnit.$.availableToCommitMPQuantity": finalBuildableQty 
           } 
         },
         { session }
       );
+
+      // If no unit entry existed (matchedCount === 0), push a new one
+      if (updateResult.matchedCount === 0) {
+        console.log(`      🆕 Unit entry missing in MP. Pushing new unit stock record.`);
+        await MainParentProduct.updateOne(
+          { _id: mp._id },
+          { 
+            $push: { 
+              stockByUnit: { 
+                unitId: unitId, 
+                totalMPQuantity: finalBuildableQty,
+                availableToCommitMPQuantity: finalBuildableQty,
+                committedMPQuantity: 0
+              } 
+            } 
+          },
+          { session }
+        );
+      } else {
+        console.log(`      🆙 Updated existing unit entry successfully.`);
+      }
     }
+    console.log(`--- 🏁 RECALCULATE END ---\n`);
+
+  } catch (err) {
+    console.error(`❌ RECALCULATE ERROR: ${err.message}`);
+    throw err; // Re-throw to trigger session rollback in main controller
   }
 }
