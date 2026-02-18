@@ -1548,3 +1548,66 @@ exports.getInwardsByDate = async (req, res) => {
     });
   }
 };
+
+async function recalculateMainParentsForParent(parentProductId, unitId, session = null) {
+  const unitIdStr = unitId.toString();
+
+  // 1. Find Main Parents that depend on this specific Parent Product
+  const mainParents = await MainParentProduct.find({
+    "parentProducts.parentProductId": parentProductId
+  }).session(session).lean();
+
+  if (!mainParents.length) return;
+
+  // 2. Collect all Parent Product IDs needed for these Main Parents to check their current stock
+  const parentProductIds = new Set();
+  mainParents.forEach(mp => {
+    mp.parentProducts?.forEach(config => {
+      if (config.parentProductId) parentProductIds.add(config.parentProductId.toString());
+    });
+  });
+
+  const parentProducts = await ParentProduct.find({
+    _id: { $in: Array.from(parentProductIds) }
+  }).session(session).lean();
+
+  const ppMap = new Map(parentProducts.map(pp => [pp._id.toString(), pp]));
+
+  const bulkOps = [];
+
+  // 3. Loop through Main Parents and calculate buildable quantity
+  for (const mp of mainParents) {
+    let minPossibleUnits = Infinity;
+    const requiredParents = mp.parentProducts || [];
+
+    for (const config of requiredParents) {
+      const pp = ppMap.get(config.parentProductId?.toString());
+      const requiredQty = Number(config.quantity) || 1;
+      const stockRecord = pp?.stockByUnit?.find(s => s.unitId?.toString() === unitIdStr);
+      
+      const availableQty = Number(stockRecord?.availableToCommitPPQuantity) || 0;
+      const possible = Math.floor(availableQty / requiredQty);
+      minPossibleUnits = Math.min(minPossibleUnits, possible);
+    }
+
+    const finalBuildableQty = minPossibleUnits === Infinity ? 0 : minPossibleUnits;
+
+    // 4. ATOMIC UPDATE: Only target the specific unit entry in the array
+    bulkOps.push({
+      updateOne: {
+        filter: { _id: mp._id, "stockByUnit.unitId": unitId },
+        update: { 
+          $set: { 
+            "stockByUnit.$.totalMPQuantity": finalBuildableQty,
+            "stockByUnit.$.availableToCommitMPQuantity": finalBuildableQty 
+          } 
+        }
+      }
+    });
+  }
+
+  if (bulkOps.length > 0) {
+    // We use bulkWrite because it is much faster and safer than looping .save()
+    await MainParentProduct.bulkWrite(bulkOps, { session });
+  }
+}
