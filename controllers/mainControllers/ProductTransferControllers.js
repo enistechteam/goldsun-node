@@ -1567,15 +1567,14 @@ exports.getInwardsByDate = async (req, res) => {
 async function recalculateMainParentsForParent(parentProductId, unitId, session = null) {
   const unitIdStr = unitId.toString();
 
-  // 1. Find all Main Parents that depend on this specific Parent Product
+  // 1. Find all Main Parents depending on this Parent Product
   const mainParents = await MainParentProduct.find({
     "parentProducts.parentProductId": parentProductId
   }).session(session).lean();
 
   if (!mainParents.length) return;
 
-  // 2. Collect all Parent Product IDs needed for these Main Parents 
-  // to calculate the current buildable capacity
+  // 2. Fetch all necessary Parent Products to calculate the "bottleneck"
   const parentProductIds = new Set();
   mainParents.forEach(mp => {
     mp.parentProducts?.forEach(config => {
@@ -1589,42 +1588,57 @@ async function recalculateMainParentsForParent(parentProductId, unitId, session 
 
   const ppMap = new Map(parentProducts.map(pp => [pp._id.toString(), pp]));
 
-  const bulkOps = [];
-
-  // 3. Calculate the maximum buildable Main Parents based on constituent stock
   for (const mp of mainParents) {
     let minPossibleUnits = Infinity;
     const requiredParents = mp.parentProducts || [];
 
+    // Calculate buildable quantity
     for (const config of requiredParents) {
       const pp = ppMap.get(config.parentProductId?.toString());
-      const requiredQty = Number(config.quantity) || 1;
-      const stockRecord = pp?.stockByUnit?.find(s => s.unitId?.toString() === unitIdStr);
+      const requiredQtyPerMP = Number(config.quantity) || 1;
       
+      // Find stock for specific unit in the constituent Parent Product
+      const stockRecord = pp?.stockByUnit?.find(s => s.unitId?.toString() === unitIdStr);
       const availableQty = Number(stockRecord?.availableToCommitPPQuantity) || 0;
-      const possible = Math.floor(availableQty / requiredQty);
-      minPossibleUnits = Math.min(minPossibleUnits, possible);
+      
+      const possible = Math.floor(availableQty / requiredQtyPerMP);
+      if (possible < minPossibleUnits) minPossibleUnits = possible;
     }
 
-    const finalBuildableQty = minPossibleUnits === Infinity ? 0 : minPossibleUnits;
+    const finalBuildableQty = minPossibleUnits === Infinity ? 0 : Math.max(0, minPossibleUnits);
 
-    // 4. ATOMIC UPDATE: Target only the specific unit entry in the array
-    // This prevents overwriting other units or other fields in the document
-    bulkOps.push({
-      updateOne: {
-        filter: { _id: mp._id, "stockByUnit.unitId": unitId },
-        update: { 
-          $set: { 
-            "stockByUnit.$.totalMPQuantity": finalBuildableQty,
-            "stockByUnit.$.availableToCommitMPQuantity": finalBuildableQty 
+    // 3. ATOMIC UPSERT LOGIC
+    // First, try to update the existing unit entry
+    const updateResult = await MainParentProduct.updateOne(
+      { 
+        _id: mp._id, 
+        "stockByUnit.unitId": unitId 
+      },
+      { 
+        $set: { 
+          "stockByUnit.$.totalMPQuantity": finalBuildableQty,
+          "stockByUnit.$.availableToCommitMPQuantity": finalBuildableQty 
+        } 
+      },
+      { session }
+    );
+
+    // If no unit entry existed (modifiedCount === 0), push a new one
+    if (updateResult.matchedCount === 0) {
+      await MainParentProduct.updateOne(
+        { _id: mp._id },
+        { 
+          $push: { 
+            stockByUnit: { 
+              unitId: unitId, 
+              totalMPQuantity: finalBuildableQty,
+              availableToCommitMPQuantity: finalBuildableQty,
+              committedMPQuantity: 0
+            } 
           } 
-        }
-      }
-    });
-  }
-
-  if (bulkOps.length > 0) {
-    // bulkWrite is the safest way to perform multiple updates inside a transaction
-    await MainParentProduct.bulkWrite(bulkOps, { session });
+        },
+        { session }
+      );
+    }
   }
 }
