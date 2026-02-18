@@ -562,59 +562,90 @@ exports.adjustStock = async (req, res) => {
   try {
     const { unitId, productid, quantity, productType, Reason, Description, user } = req.body;
 
-     if (!unitId || !productid || !quantity || !productType) {
+    if (!unitId || !productid || !quantity || !productType) {
       throw new Error("Missing required fields.");
     }
 
-    let model, totalField, availableField, nameField, codeField;
+    let model, totalField, availableField;
     switch (productType) {
       case "Child Product":
         model = ChildProduct;
         totalField = "totalCPQuantity";
         availableField = "availableToCommitCPQuantity";
-        nameField = "childProductName"; codeField = "childProductCode";
         break;
       case "Parent Product":
         model = ParentProduct;
         totalField = "totalPPQuantity";
         availableField = "availableToCommitPPQuantity";
-        nameField = "parentProductName"; codeField = "parentProductCode";
         break;
       case "Main Parent":
-        model = MainParent;
+        model = MainParent; // Ensure this is the correct Model name
         totalField = "totalMPQuantity";
         availableField = "availableToCommitMPQuantity";
-        nameField = "mainParentProductName"; codeField = "mainParentProductCode";
         break;
       default:
         throw new Error("Invalid product type.");
     }
 
     // 1. ATOMIC ADJUSTMENT (Primary Product)
-    
     const updatedDoc = await model.findOneAndUpdate(
       { 
         _id: productid, 
         "stockByUnit.unitId": unitId, 
-        [`stockByUnit.${availableField.split('.').pop()}`]: { $gte: quantity } 
+        [`stockByUnit.${availableField}`]: { $gte: Number(quantity) } 
       },
-      { $inc: { [totalField]: -quantity, [availableField]: -quantity } },
+      { 
+        $inc: { 
+          [`stockByUnit.$.${totalField}`]: -Number(quantity), 
+          [`stockByUnit.$.${availableField}`]: -Number(quantity) 
+        } 
+      },
       { session, new: false }
     );
 
-    if (!updatedDoc) throw new Error("Insufficient stock for adjustment.");
+    if (!updatedDoc) throw new Error("Insufficient stock for adjustment or unit record not found.");
 
-    const stockObj = updatedDoc.stockByUnit.find(s => s.unitId.toString() === unitId.toString());
-    const currentQty = stockObj[availableField.split('.').pop()] || 0;
+    // 2. CONSTITUENT SYNC (If adjusting a Main Parent)
+    // If we remove 10 Kits, we must remove 10 of each Parent Product inside it
+    if (productType === "Main Parent" && updatedDoc.parentProducts?.length > 0) {
+      for (const config of updatedDoc.parentProducts) {
+        const requiredPPQty = Number(quantity) * config.quantity;
+        
+        const ppUpdate = await ParentProduct.updateOne(
+          { 
+            _id: config.parentProductId, 
+            "stockByUnit.unitId": unitId,
+            "stockByUnit.availableToCommitPPQuantity": { $gte: requiredPPQty }
+          },
+          { 
+            $inc: { 
+              "stockByUnit.$.totalPPQuantity": -requiredPPQty, 
+              "stockByUnit.$.availableToCommitPPQuantity": -requiredPPQty 
+            } 
+          },
+          { session }
+        );
 
+        if (ppUpdate.matchedCount === 0) {
+          throw new Error(`Insufficient constituent stock for parent product: ${config.parentProductId}`);
+        }
+
+        // Trigger recalculation for this parent so other Main Parents are updated
+        await recalculateMainParentsForParent(config.parentProductId, unitId, session);
+      }
+    }
+
+    // 3. RECALCULATE (If a single Parent Product was adjusted)
     if (productType === "Parent Product") {
       await recalculateMainParentsForParent(productid, unitId, session);
     }
 
-    // YOUR EXACT LOG CALL
+    // 4. LOGGING
+    const stockObj = updatedDoc.stockByUnit.find(s => s.unitId.toString() === unitId.toString());
+    const currentQty = Number(stockObj[availableField]) || 0;
+
     await logCountChange.logCreate({
       employeeId: user?.employeeId, employeeCode: user?.employeeCode, employeeName: user?.employeeName,
-      departmentId: user?.departmentId, departmentName: null, role: user?.role,
       unitId: unitId, unitName: user?.unitName,
       childProductId: productType === "Child Product" ? productid : null,
       parentProductId: productType === "Parent Product" ? productid : null,
@@ -622,7 +653,7 @@ exports.adjustStock = async (req, res) => {
       action: "stock_adjustment", module: "Stock",
       entityName: updatedDoc.parentProductName || updatedDoc.mainParentProductName || updatedDoc.childProductName,
       entityCode: updatedDoc.parentProductCode || updatedDoc.mainParentProductCode || updatedDoc.childProductCode,
-      changeField: "totalQuantity", oldValue: currentQty, activityValue: -quantity, newValue: currentQty - quantity,
+      changeField: "totalQuantity", oldValue: currentQty, activityValue: -Number(quantity), newValue: currentQty - Number(quantity),
       description: `Stock adjusted from ${currentQty} by -${quantity} and the new quantity is ${currentQty - quantity}. Reason: ${Reason}. Details: ${Description}`,
       ipAddress: req.ip, userAgent: req.headers["user-agent"]
     }, { session });
@@ -630,7 +661,7 @@ exports.adjustStock = async (req, res) => {
     await session.commitTransaction();
     res.status(200).json({ message: "Stock adjusted successfully." });
   } catch (error) {
-    await session.abortTransaction();
+    if (session.inTransaction()) await session.abortTransaction();
     res.status(500).json({ message: error.message });
   } finally {
     session.endSession();
