@@ -865,11 +865,12 @@ exports.createProductOutward = async (req, res) => {
         inwardDetails.push(detailItem);
 
         const entityName = fromDoc.childProductName || fromDoc.parentProductName || fromDoc.mainParentProductName;
+        const entityCode = fromDoc.childProductCode || fromDoc.parentProductCode || fromDoc.mainParentProductCode;
 
         // KEEPING YOUR EXACT LOG STRUCTURE
         await ActivityLog.logCreate({
           employeeId: user?.employeeId, employeeCode: user?.employeeCode, employeeName: user?.employeeName,
-          unitId: fromUnitId, unitName: user?.unitName, childProductId, parentProductId, mainParentId,
+          unitId: fromUnitId, unitName: user?.unitName, childProductId, parentProductId, mainParentId, entityCode,
           orderCode: outwardCode, orderType: "ProductOutward", action: "Outwards", module: "Product Outward",
           entityName, changeField: config.avail, oldValue: fromOldQty, activityValue: quantity, newValue: fromNewQty,
           description: `Outwarded ${quantity} units of ${entityName} from ${FromUnitDoc.UnitName} to ${ToUnitDoc.UnitName}, current Stock in ${FromUnitDoc.UnitName} - ${fromNewQty}, current stock in ${ToUnitDoc.UnitName} - ${toNewQty} `,
