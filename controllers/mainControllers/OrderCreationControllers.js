@@ -1075,6 +1075,207 @@ exports.bulkExecuteOrders = async (req, res) => {
 // };
 
 
+// exports.updateAssignedQuantities = async (req, res) => {
+//   const session = await mongoose.startSession();
+//   session.startTransaction();
+
+//   try {
+//     const { orderId, productDetails, unitId, user } = req.body;
+
+//     if (!orderId || !unitId || !Array.isArray(productDetails)) {
+//       throw new Error("Missing required data.");
+//     }
+
+//     const order = await Order.findById(orderId).session(session);
+//     if (!order) throw new Error("Order not found.");
+
+//     // Track IDs to fetch fresh data for the response at the end
+//     const allIds = { parent: new Set(), main: new Set(), type: new Set() };
+//     const logsToCreate = [];
+//     let updatedCount = 0;
+
+//     for (const incoming of productDetails) {
+//       const { productTypeId, parentProductId, mainParentId, assignedQuantity } = incoming;
+
+//       const matched = order.productDetails.find((pd) =>
+//         pd.productTypeId?.toString() === (productTypeId || "") &&
+//         (pd.parentProductId?.toString() || null) === (parentProductId || null) &&
+//         (pd.mainParentId?.toString() || null) === (mainParentId || null)
+//       );
+
+//       if (!matched) continue;
+
+//       const prevAssignedQty = matched.assignedQuantity || 0;
+//       const newAssignedQty = assignedQuantity === "" ? 0 : Number(assignedQuantity);
+//       const diff = newAssignedQty - prevAssignedQty;
+
+//       if (isNaN(newAssignedQty) || newAssignedQty < 0 || diff === 0) continue;
+
+//       // --- ATOMIC UPDATE FOR PARENT PRODUCT ---
+//       if (parentProductId) {
+//         const updatedDoc = await ParentProduct.findOneAndUpdate(
+//           { 
+//             _id: parentProductId, 
+//             "stockByUnit.unitId": unitId,
+//             ...(diff > 0 ? { "stockByUnit.availableToCommitPPQuantity": { $gte: diff } } : {})
+//           },
+//           { $inc: { "stockByUnit.$[elem].availableToCommitPPQuantity": -diff } },
+//           { 
+//             session, 
+//             arrayFilters: [{ "elem.unitId": unitId }],
+//             new: false, // Accurate "Before" state for your logs
+//             projection: { stockByUnit: { $elemMatch: { unitId } }, parentProductName: 1, parentProductCode: 1 } 
+//           }
+//         );
+
+//         if (!updatedDoc) throw new Error(`Insufficient stock for ${parentProductId}`);
+
+//         const stockBefore = updatedDoc.stockByUnit[0].availableToCommitPPQuantity;
+//         const stockAfter = stockBefore - diff;
+
+//         await recalculateMainParentsForParent(parentProductId, unitId, session);
+        
+//         logsToCreate.push({
+//           employeeId: user?.employeeId, employeeCode: user?.employeeCode,
+//           employeeName: user?.employeeName,
+//           departmentId: user?.departmentId,
+//           departmentName: user?.departmentName, 
+//           role: user?.role,
+//           unitId, 
+//           unitName: user?.unitName, 
+//           customerID: order.customerId, 
+//           parentProductId,
+//           orderId: order._id, orderCode: order.orderCode, orderType: order.orderType, orderStatus: order.status,
+//           action: "Stock assigned", module: "Order", entityName: updatedDoc.parentProductName, entityCode: updatedDoc.parentProductCode,
+//           changeField: "assignedQuantity", oldValue: prevAssignedQty, activityValue: newAssignedQty, newValue: newAssignedQty,
+//           description: `Assigned quantity ${newAssignedQty} of ${updatedDoc.parentProductName} in ${order.orderCode}. Stock before: ${stockBefore}, After: ${stockAfter} - Unit: ${user?.unitName}`,
+//           ipAddress: req.ip, userAgent: req.headers["user-agent"]
+//         });
+//       }
+
+//       // --- ATOMIC UPDATE FOR MAIN PARENT PRODUCT ---
+//       else if (mainParentId) {
+//         const updatedDoc = await MainParentProduct.findOneAndUpdate(
+//           { 
+//             _id: mainParentId, 
+//             "stockByUnit.unitId": unitId,
+//             ...(diff > 0 ? { "stockByUnit.totalMPQuantity": { $gte: diff } } : {})
+//           },
+//           { $inc: { "stockByUnit.$[elem].totalMPQuantity": -diff } },
+//           { 
+//             session, 
+//             arrayFilters: [{ "elem.unitId": unitId }],
+//             new: false,
+//             projection: { stockByUnit: { $elemMatch: { unitId } }, mainParentProductName: 1, mainParentProductCode: 1, parentProducts: 1 } 
+//           }
+//         );
+
+//         if (!updatedDoc) throw new Error(`Insufficient stock for ${mainParentId}`);
+
+//         const stockBefore = updatedDoc.stockByUnit[0].totalMPQuantity;
+
+//         // Sync components if Main Parent has constituents
+//         if (updatedDoc.parentProducts?.length > 0) {
+//           for (const config of updatedDoc.parentProducts) {
+//             const rQty = diff * config.quantity;
+//             if (rQty <= 0) continue;
+//             await ParentProduct.updateOne(
+//               { _id: config.parentProductId, "stockByUnit.unitId": unitId, "stockByUnit.availableToCommitPPQuantity": { $gte: rQty } },
+//               { $inc: { "stockByUnit.$[elem].availableToCommitPPQuantity": -rQty } },
+//               { session, arrayFilters: [{ "elem.unitId": unitId }] }
+//             );
+//             await recalculateMainParentsForParent(config.parentProductId, unitId, session);
+//           }
+//         }
+
+//         logsToCreate.push({
+//           employeeId: user?.employeeId, employeeCode: user?.employeeCode, employeeName: user?.employeeName,
+//           unitId, unitName: user?.unitName, customerID: order.customerId, mainParentId,
+//           orderId: order._id, orderCode: order.orderCode, orderType: order.orderType, orderStatus: order.status,
+//           action: "Stock assigned", module: "Order", entityName: updatedDoc.mainParentProductName, entityCode: updatedDoc.mainParentProductCode,
+//           changeField: "assignedQuantity", oldValue: prevAssignedQty, activityValue: newAssignedQty, newValue: newAssignedQty,
+//           description: `Assigned quantity ${newAssignedQty} of ${updatedDoc.mainParentProductName}. Stock before: ${stockBefore}, After: ${stockBefore - diff} - Unit: ${user?.unitName}`,
+//           ipAddress: req.ip, userAgent: req.headers["user-agent"]
+//         });
+//       }
+
+//       matched.assignedQuantity = newAssignedQty;
+//       updatedCount++;
+//     }
+
+//     if (updatedCount > 0) {
+//       await order.save({ session });
+//       if (logsToCreate.length) await Logs.insertMany(logsToCreate, { session });
+//       await session.commitTransaction();
+
+//       // --- FETCH FRESH DATA FOR RESPONSE ---
+//       // We collect all IDs from the updated order to rebuild the enrichedDetails
+//       order.productDetails.forEach((item) => {
+//         if (item.productTypeId) allIds.type.add(item.productTypeId.toString());
+//         if (item.parentProductId) allIds.parent.add(item.parentProductId.toString());
+//         if (item.mainParentId) allIds.main.add(item.mainParentId.toString());
+//       });
+
+//       const [parentDocs, mainDocs, typeDocs] = await Promise.all([
+//         allIds.parent.size ? ParentProduct.find({ _id: { $in: Array.from(allIds.parent) } }).lean() : [],
+//         allIds.main.size ? MainParentProduct.find({ _id: { $in: Array.from(allIds.main) } }).lean() : [],
+//         allIds.type.size ? ProductType.find({ _id: { $in: Array.from(allIds.type) } }).lean() : []
+//       ]);
+
+//       const maps = {
+//         parent: new Map(parentDocs.map(d => [d._id.toString(), d])),
+//         main: new Map(mainDocs.map(d => [d._id.toString(), d])),
+//         type: new Map(typeDocs.map(d => [d._id.toString(), d]))
+//       };
+
+//       const enrichedDetails = order.productDetails.map((detail) => {
+//         const type = detail.productTypeId ? maps.type.get(detail.productTypeId.toString()) : null;
+//         let stockQty = 0;
+//         let nameInfo = {};
+
+//         if (detail.parentProductId) {
+//           const d = maps.parent.get(detail.parentProductId.toString());
+//           if (d) {
+//             const stockRecord = d.stockByUnit?.find(s => s.unitId.toString() === unitId.toString());
+//             stockQty = stockRecord?.availableToCommitPPQuantity || 0;
+//             nameInfo = { parentProductName: d.parentProductName };
+//           }
+//         } else if (detail.mainParentId) {
+//           const d = maps.main.get(detail.mainParentId.toString());
+//           if (d) {
+//             const stockRecord = d.stockByUnit?.find(s => s.unitId.toString() === unitId.toString());
+//             stockQty = stockRecord?.totalMPQuantity || 0;
+//             nameInfo = { mainParentProductName: d.mainParentProductName };
+//           }
+//         }
+
+//         return { 
+//           ...detail.toObject(), 
+//           productTypeName: type?.productTypeName, 
+//           ...nameInfo, 
+//           availableQuantity: stockQty 
+//         };
+//       });
+
+//       session.endSession();
+//       return res.status(200).json({ 
+//         message: "Assigned quantities updated successfully.", 
+//         updatedProductDetails: enrichedDetails 
+//       });
+
+//     } else {
+//       await session.abortTransaction();
+//       session.endSession();
+//       return res.status(404).json({ message: "No matching product details found to update." });
+//     }
+
+//   } catch (error) {
+//     if (session.inTransaction()) await session.abortTransaction();
+//     session.endSession();
+//     return res.status(500).json({ message: error.message || "Server error" });
+//   }
+// };
+
 exports.updateAssignedQuantities = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -1083,13 +1284,12 @@ exports.updateAssignedQuantities = async (req, res) => {
     const { orderId, productDetails, unitId, user } = req.body;
 
     if (!orderId || !unitId || !Array.isArray(productDetails)) {
-      throw new Error("Missing required data.");
+      throw new Error("Missing required data: orderId, unitId, or productDetails.");
     }
 
     const order = await Order.findById(orderId).session(session);
     if (!order) throw new Error("Order not found.");
 
-    // Track IDs to fetch fresh data for the response at the end
     const allIds = { parent: new Set(), main: new Set(), type: new Set() };
     const logsToCreate = [];
     let updatedCount = 0;
@@ -1109,51 +1309,46 @@ exports.updateAssignedQuantities = async (req, res) => {
       const newAssignedQty = assignedQuantity === "" ? 0 : Number(assignedQuantity);
       const diff = newAssignedQty - prevAssignedQty;
 
+      // Skip if there is no actual numerical change
       if (isNaN(newAssignedQty) || newAssignedQty < 0 || diff === 0) continue;
 
-      // --- ATOMIC UPDATE FOR PARENT PRODUCT ---
+      // --- CASE 1: PARENT PRODUCT ---
       if (parentProductId) {
         const updatedDoc = await ParentProduct.findOneAndUpdate(
           { 
             _id: parentProductId, 
             "stockByUnit.unitId": unitId,
+            // If diff > 0, we are increasing assignment, so check if available stock >= diff
             ...(diff > 0 ? { "stockByUnit.availableToCommitPPQuantity": { $gte: diff } } : {})
           },
           { $inc: { "stockByUnit.$[elem].availableToCommitPPQuantity": -diff } },
           { 
             session, 
             arrayFilters: [{ "elem.unitId": unitId }],
-            new: false, // Accurate "Before" state for your logs
+            new: false, // returns doc BEFORE update for logs
             projection: { stockByUnit: { $elemMatch: { unitId } }, parentProductName: 1, parentProductCode: 1 } 
           }
         );
 
-        if (!updatedDoc) throw new Error(`Insufficient stock for ${parentProductId}`);
+        if (!updatedDoc) throw new Error(`Insufficient stock for ${parentProductId} in ${user?.unitName}`);
 
         const stockBefore = updatedDoc.stockByUnit[0].availableToCommitPPQuantity;
-        const stockAfter = stockBefore - diff;
+        const actualStockAfter = stockBefore - diff;
 
         await recalculateMainParentsForParent(parentProductId, unitId, session);
         
         logsToCreate.push({
-          employeeId: user?.employeeId, employeeCode: user?.employeeCode,
-          employeeName: user?.employeeName,
-          departmentId: user?.departmentId,
-          departmentName: user?.departmentName, 
-          role: user?.role,
-          unitId, 
-          unitName: user?.unitName, 
-          customerID: order.customerId, 
-          parentProductId,
-          orderId: order._id, orderCode: order.orderCode, orderType: order.orderType, orderStatus: order.status,
+          employeeId: user?.employeeId, employeeCode: user?.employeeCode, employeeName: user?.employeeName,
+          unitId, unitName: user?.unitName, customerID: order.customerId, parentProductId,
+          orderId: order._id, orderCode: order.orderCode, orderType: order.orderType,
           action: "Stock assigned", module: "Order", entityName: updatedDoc.parentProductName, entityCode: updatedDoc.parentProductCode,
           changeField: "assignedQuantity", oldValue: prevAssignedQty, activityValue: newAssignedQty, newValue: newAssignedQty,
-          description: `Assigned quantity ${newAssignedQty} of ${updatedDoc.parentProductName} in ${order.orderCode}. Stock before: ${stockBefore}, After: ${stockAfter} - Unit: ${user?.unitName}`,
+          description: `Changed assignment from ${prevAssignedQty} to ${newAssignedQty} for ${updatedDoc.parentProductName}. Stock: ${stockBefore} -> ${actualStockAfter} (Unit: ${user?.unitName})`,
           ipAddress: req.ip, userAgent: req.headers["user-agent"]
         });
       }
 
-      // --- ATOMIC UPDATE FOR MAIN PARENT PRODUCT ---
+      // --- CASE 2: MAIN PARENT PRODUCT ---
       else if (mainParentId) {
         const updatedDoc = await MainParentProduct.findOneAndUpdate(
           { 
@@ -1170,17 +1365,17 @@ exports.updateAssignedQuantities = async (req, res) => {
           }
         );
 
-        if (!updatedDoc) throw new Error(`Insufficient stock for ${mainParentId}`);
+        if (!updatedDoc) throw new Error(`Insufficient stock for ${mainParentId} in ${user?.unitName}`);
 
         const stockBefore = updatedDoc.stockByUnit[0].totalMPQuantity;
+        const actualStockAfter = stockBefore - diff;
 
-        // Sync components if Main Parent has constituents
+        // Sync constituent parent products
         if (updatedDoc.parentProducts?.length > 0) {
           for (const config of updatedDoc.parentProducts) {
             const rQty = diff * config.quantity;
-            if (rQty <= 0) continue;
             await ParentProduct.updateOne(
-              { _id: config.parentProductId, "stockByUnit.unitId": unitId, "stockByUnit.availableToCommitPPQuantity": { $gte: rQty } },
+              { _id: config.parentProductId, "stockByUnit.unitId": unitId },
               { $inc: { "stockByUnit.$[elem].availableToCommitPPQuantity": -rQty } },
               { session, arrayFilters: [{ "elem.unitId": unitId }] }
             );
@@ -1190,11 +1385,11 @@ exports.updateAssignedQuantities = async (req, res) => {
 
         logsToCreate.push({
           employeeId: user?.employeeId, employeeCode: user?.employeeCode, employeeName: user?.employeeName,
-          unitId, unitName: user?.unitName, customerID: order.customerId, mainParentId,
-          orderId: order._id, orderCode: order.orderCode, orderType: order.orderType, orderStatus: order.status,
+          unitId, unitName: user?.unitName, mainParentId,
+          orderId: order._id, orderCode: order.orderCode,
           action: "Stock assigned", module: "Order", entityName: updatedDoc.mainParentProductName, entityCode: updatedDoc.mainParentProductCode,
           changeField: "assignedQuantity", oldValue: prevAssignedQty, activityValue: newAssignedQty, newValue: newAssignedQty,
-          description: `Assigned quantity ${newAssignedQty} of ${updatedDoc.mainParentProductName}. Stock before: ${stockBefore}, After: ${stockBefore - diff} - Unit: ${user?.unitName}`,
+          description: `Changed assignment from ${prevAssignedQty} to ${newAssignedQty} for ${updatedDoc.mainParentProductName}. Stock: ${stockBefore} -> ${actualStockAfter} (Unit: ${user?.unitName})`,
           ipAddress: req.ip, userAgent: req.headers["user-agent"]
         });
       }
@@ -1208,8 +1403,7 @@ exports.updateAssignedQuantities = async (req, res) => {
       if (logsToCreate.length) await Logs.insertMany(logsToCreate, { session });
       await session.commitTransaction();
 
-      // --- FETCH FRESH DATA FOR RESPONSE ---
-      // We collect all IDs from the updated order to rebuild the enrichedDetails
+      // --- REFRESH DATA FOR RESPONSE ---
       order.productDetails.forEach((item) => {
         if (item.productTypeId) allIds.type.add(item.productTypeId.toString());
         if (item.parentProductId) allIds.parent.add(item.parentProductId.toString());
@@ -1272,7 +1466,7 @@ exports.updateAssignedQuantities = async (req, res) => {
   } catch (error) {
     if (session.inTransaction()) await session.abortTransaction();
     session.endSession();
-    return res.status(500).json({ message: error.message || "Server error" });
+    return res.status(500).json({ success: false, message: error.message || "Internal server error" });
   }
 };
 
