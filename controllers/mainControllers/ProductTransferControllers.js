@@ -923,15 +923,23 @@ exports.createProductOutward = async (req, res) => {
 
       console.log("--- 🚀 STARTING OUTWARD TRANSACTION ---");
 
-      //       // 2. Generate Codes
+      // 1. Generate Codes
       const [lastOutward, lastInward] = await Promise.all([
         ProductOutward.findOne({ outwardCode: { $regex: /^OUTW\d{7}$/ } }).sort({ outwardCode: -1 }).session(session),
         ProductInward.findOne({ inwardCode: { $regex: /^INWD\d{7}$/ } }).sort({ inwardCode: -1 }).session(session)
       ]);
 
-        const outwardCode = lastOutward ? `OUTW${(parseInt(lastOutward.outwardCode.slice(4)) + 1).toString().padStart(7, '0')}` : 'OUTW0000001';
+      const outwardCode = lastOutward ? `OUTW${(parseInt(lastOutward.outwardCode.slice(4)) + 1).toString().padStart(7, '0')}` : 'OUTW0000001';
       const inwardCode = lastInward ? `INWD${(parseInt(lastInward.inwardCode.slice(4)) + 1).toString().padStart(7, '0')}` : 'INWD0000001';
-            // 3. Consolidate Products
+
+      // 2. Fetch Unit Documents once to avoid redundant calls in loop
+      const [FromUnitDoc, ToUnitDoc] = await Promise.all([
+        Unit.findById(fromUnitId).session(session),
+        Unit.findById(toUnitId).session(session)
+      ]);
+      if (!FromUnitDoc || !ToUnitDoc) throw new Error('Invalid unit IDs');
+
+      // 3. Consolidate Products
       const consolidated = products.reduce((acc, item) => {
         const id = item.childProductId || item.parentProductId || item.mainParentId;
         const key = `${item.productType}_${id}`;
@@ -940,59 +948,69 @@ exports.createProductOutward = async (req, res) => {
         return acc;
       }, {});
 
-          const uniqueProducts = Object.values(consolidated);
+      const uniqueProducts = Object.values(consolidated);
       const outwardDetails = [];
       const inwardDetails = [];
 
       for (const item of uniqueProducts) {
-        const { productType, childProductId, parentProductId, mainParentId, quantity } = item;
+        const { productType, childProductId, parentProductId, mainParentId, quantity, productTypeId } = item;
         const pId = childProductId || parentProductId || mainParentId;
         const normalizedType = productType.trim();
 
         const configMap = {
           'Child Product': { model: ChildProduct, avail: 'availableToCommitCPQuantity', total: 'totalCPQuantity' },
           'Parent Product': { model: ParentProduct, avail: 'availableToCommitPPQuantity', total: 'totalPPQuantity' },
-          'Main Parent': { model: MainParentProduct, avail: 'totalMPQuantity', total: 'totalMPQuantity' }
+          'Main Parent': { model: MainParentProduct, avail: 'availableToCommitMPQuantity', total: 'totalMPQuantity' }
         };
         const config = configMap[normalizedType];
 
-        // 1. DEBIT SOURCE
+        // ------------------------------------------------------------
+        // ATOMIC DEBIT FROM SOURCE
+        // ------------------------------------------------------------
         const fromDoc = await config.model.findOneAndUpdate(
           { _id: pId, "stockByUnit.unitId": fromUnitId, [`stockByUnit.${config.avail}`]: { $gte: quantity } },
           { $inc: { [`stockByUnit.$.${config.total}`]: -quantity, [`stockByUnit.$.${config.avail}`]: -quantity } },
-          { session, new: false }
+          { session, new: false, projection: { stockByUnit: { $elemMatch: { unitId: fromUnitId } }, childProductName: 1, parentProductName: 1, mainParentProductName: 1, childProductCode: 1, parentProductCode: 1, mainParentProductCode: 1, parentProducts: 1 } }
         );
-        if (!fromDoc) throw new Error(`Insufficient stock for ${pId}`);
+
+        if (!fromDoc) throw new Error(`Insufficient stock for ${pId} in ${FromUnitDoc.UnitName}`);
         
-        const fromStockBefore = fromDoc.stockByUnit.find(s => s.unitId.toString() === fromUnitId.toString())[config.avail];
-  const fromStockObj = fromDoc.stockByUnit.find(s => s.unitId.toString() === fromUnitId.toString());
-        const fromOldQty = fromStockObj[config.avail];
-        // 2. CREDIT DESTINATION
+        // RECTIFIED: Exact oldValue from the returned document
+        const fromOldQty = fromDoc.stockByUnit[0][config.avail];
+        const fromNewQty = fromOldQty - quantity;
+
+        // ------------------------------------------------------------
+        // ATOMIC CREDIT TO DESTINATION
+        // ------------------------------------------------------------
         const toDoc = await config.model.findOneAndUpdate(
           { _id: pId, "stockByUnit.unitId": toUnitId },
           { $inc: { [`stockByUnit.$.${config.total}`]: quantity, [`stockByUnit.$.${config.avail}`]: quantity } },
-          { session, new: false }
+          { session, new: false, projection: { stockByUnit: { $elemMatch: { unitId: toUnitId } } } }
         );
 
         let toOldQty = 0;
         if (!toDoc) {
+          // If unit doesn't exist,Old qty is 0, and we push the new unit record
           await config.model.updateOne(
             { _id: pId },
-            { $push: { stockByUnit: { unitId: toUnitId, [config.total]: quantity, [config.avail]: quantity, committedMPQuantity: 0 } } },
+            { $push: { stockByUnit: { unitId: toUnitId, [config.total]: quantity, [config.avail]: quantity, committedMPQuantity: 0, committedPPQuantity: 0, committedCPQuantity: 0 } } },
             { session }
           );
+          toOldQty = 0;
         } else {
-          const toStockObj = toDoc.stockByUnit.find(s => s.unitId.toString() === toUnitId.toString());
-          toOldQty = toStockObj[config.avail] || 0;
+          // RECTIFIED: Safely extract old quantity from the matched element
+          toOldQty = toDoc.stockByUnit[0][config.avail] || 0;
         }
+        const toNewQty = toOldQty + quantity;
 
-        // 3. CONSTITUENT SYNC & RECALCULATE
+        // ------------------------------------------------------------
+        // CONSTITUENT SYNC & RECALCULATE
+        // ------------------------------------------------------------
         if (normalizedType === 'Main Parent' && fromDoc.parentProducts?.length > 0) {
           for (const cp of fromDoc.parentProducts) {
             const reqQty = quantity * cp.quantity;
             const ppId = cp.parentProductId;
 
-            // Update Parent Stocks
             await ParentProduct.updateOne(
               { _id: ppId, "stockByUnit.unitId": fromUnitId },
               { $inc: { "stockByUnit.$.totalPPQuantity": -reqQty, "stockByUnit.$.availableToCommitPPQuantity": -reqQty } },
@@ -1013,32 +1031,31 @@ exports.createProductOutward = async (req, res) => {
               );
             }
 
-            // FIXED: RECALCULATE FOR THE PARENT ID, NOT THE MAIN PARENT ID
-            console.log(`🔄 Triggering Recalculate for Parent: ${ppId}`);
             await recalculateMainParentsForParent(ppId, fromUnitId, session);
             await recalculateMainParentsForParent(ppId, toUnitId, session);
           }
         } else {
-          // If it's a direct Parent Product movement
           await recalculateMainParentsForParent(pId, fromUnitId, session);
           await recalculateMainParentsForParent(pId, toUnitId, session);
         }
 
-        // 4. LOGGING (Using the calculated numbers to ensure accuracy)
-        const fromNewQty = fromStockBefore - quantity;
-        const toNewQty = toOldQty + quantity;
-         const [FromUnitDoc, ToUnitDoc] = await Promise.all([
-        Unit.findById(fromUnitId).session(session),
-        Unit.findById(toUnitId).session(session)
-      ]);
-      
-      if (!FromUnitDoc || !ToUnitDoc) throw new Error('Invalid unit IDs');
-
+        // ------------------------------------------------------------
+        // LOGGING & DATA PREP
+        // ------------------------------------------------------------
         const entityName = fromDoc.childProductName || fromDoc.parentProductName || fromDoc.mainParentProductName;
         const entityCode = fromDoc.childProductCode || fromDoc.parentProductCode || fromDoc.mainParentProductCode;
 
+        const detailItem = { 
+          productTypeId, childProductId, parentProductId, mainParentId, quantity, 
+          fromOldQuantity: fromOldQty, fromNewQuantity: fromNewQty, 
+          toOldQuantity: toOldQty, toNewQuantity: toNewQty 
+        };
+        outwardDetails.push(detailItem);
+        inwardDetails.push(detailItem);
+
         await ActivityLog.logCreate({
-          employeeId: user?.employeeId,employeeName: user?.employeeName,employeeCode: user?.employeeCode, unitId: fromUnitId, childProductId, parentProductId, mainParentId, entityCode,
+          employeeId: user?.employeeId, employeeName: user?.employeeName, employeeCode: user?.employeeCode, 
+          unitId: fromUnitId, childProductId, parentProductId, mainParentId, entityCode,
           orderCode: outwardCode, orderType: "ProductOutward", action: "Outwards", module: "Product Outward",
           entityName, changeField: config.avail, oldValue: fromOldQty, activityValue: quantity, newValue: fromNewQty,
           description: `Outwarded ${quantity} units of ${entityName} from ${FromUnitDoc.UnitName} to ${ToUnitDoc.UnitName}. Stock: ${fromOldQty}->${fromNewQty}`,
@@ -1046,16 +1063,25 @@ exports.createProductOutward = async (req, res) => {
         }, { session });
 
         await ActivityLog.logCreate({
-          employeeId: user?.employeeId,employeeName: user?.employeeName,employeeCode: user?.employeeCode, unitId: toUnitId, childProductId, parentProductId, mainParentId, entityCode,
+          employeeId: user?.employeeId, employeeName: user?.employeeName, employeeCode: user?.employeeCode, 
+          unitId: toUnitId, childProductId, parentProductId, mainParentId, entityCode,
           orderCode: inwardCode, orderType: "ProductInward", action: "Inwards", module: "Product Inward",
           entityName, oldValue: toOldQty, activityValue: quantity, newValue: toNewQty,
           description: `Inwarded ${quantity} units of ${entityName} to ${ToUnitDoc.UnitName}. Stock: ${toOldQty}->${toNewQty}`,
           ipAddress: req.ip, userAgent: req.headers["user-agent"]
         }, { session });
       }
+
+      // 4. Save Final Records
+      await Promise.all([
+        new ProductOutward({ outwardCode, fromUnitId, toUnitId, ownerUnitId: fromUnitId, outwardDateTime: new Date(), productDetails: outwardDetails, createdBy: user?.employeeId }).save({ session }),
+        new ProductInward({ inwardCode, fromUnitId, toUnitId, ownerUnitId: toUnitId, inwardDateTime: new Date(), productDetails: inwardDetails, createdBy: user?.employeeId }).save({ session })
+      ]);
+
     });
     res.status(201).json({ success: true });
   } catch (error) {
+    console.error("Outward Error:", error.message);
     res.status(400).json({ success: false, message: error.message });
   } finally {
     await session.endSession();
