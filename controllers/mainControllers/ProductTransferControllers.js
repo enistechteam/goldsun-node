@@ -960,7 +960,7 @@ exports.createProductOutward = async (req, res) => {
         const configMap = {
           'Child Product': { model: ChildProduct, avail: 'availableToCommitCPQuantity', total: 'totalCPQuantity' },
           'Parent Product': { model: ParentProduct, avail: 'availableToCommitPPQuantity', total: 'totalPPQuantity' },
-          'Main Parent': { model: MainParentProduct, avail: 'availableToCommitMPQuantity', total: 'totalMPQuantity' }
+          'Main Parent': { model: MainParentProduct, avail: 'totalMPQuantity', total: 'totalMPQuantity' }
         };
         const config = configMap[normalizedType];
 
