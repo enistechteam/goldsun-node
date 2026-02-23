@@ -1284,7 +1284,7 @@ exports.updateAssignedQuantities = async (req, res) => {
     const { orderId, productDetails, unitId, user } = req.body;
 
     if (!orderId || !unitId || !Array.isArray(productDetails)) {
-      throw new Error("Missing required data: orderId, unitId, or productDetails.");
+      throw new Error("Missing required data.");
     }
 
     const order = await Order.findById(orderId).session(session);
@@ -1309,7 +1309,6 @@ exports.updateAssignedQuantities = async (req, res) => {
       const newAssignedQty = assignedQuantity === "" ? 0 : Number(assignedQuantity);
       const diff = newAssignedQty - prevAssignedQty;
 
-      // Skip if there is no actual numerical change
       if (isNaN(newAssignedQty) || newAssignedQty < 0 || diff === 0) continue;
 
       // --- CASE 1: PARENT PRODUCT ---
@@ -1318,19 +1317,19 @@ exports.updateAssignedQuantities = async (req, res) => {
           { 
             _id: parentProductId, 
             "stockByUnit.unitId": unitId,
-            // If diff > 0, we are increasing assignment, so check if available stock >= diff
+            // Guard: ensure we don't go negative if increasing assignment
             ...(diff > 0 ? { "stockByUnit.availableToCommitPPQuantity": { $gte: diff } } : {})
           },
-          { $inc: { "stockByUnit.$[elem].availableToCommitPPQuantity": -diff } },
+          // FIX: Use the specific positional operator $ to target the filtered unit
+          { $inc: { "stockByUnit.$.availableToCommitPPQuantity": -diff } },
           { 
             session, 
-            arrayFilters: [{ "elem.unitId": unitId }],
-            new: false, // returns doc BEFORE update for logs
+            new: false, // get state BEFORE update for logs
             projection: { stockByUnit: { $elemMatch: { unitId } }, parentProductName: 1, parentProductCode: 1 } 
           }
         );
 
-        if (!updatedDoc) throw new Error(`Insufficient stock for ${parentProductId} in ${user?.unitName}`);
+        if (!updatedDoc) throw new Error(`Stock mismatch for Parent: ${parentProductId}`);
 
         const stockBefore = updatedDoc.stockByUnit[0].availableToCommitPPQuantity;
         const actualStockAfter = stockBefore - diff;
@@ -1341,9 +1340,9 @@ exports.updateAssignedQuantities = async (req, res) => {
           employeeId: user?.employeeId, employeeCode: user?.employeeCode, employeeName: user?.employeeName,
           unitId, unitName: user?.unitName, customerID: order.customerId, parentProductId,
           orderId: order._id, orderCode: order.orderCode, orderType: order.orderType,
-          action: "Stock assigned",orderStatus: order.status, module: "Order", entityName: updatedDoc.parentProductName, entityCode: updatedDoc.parentProductCode,
+          action: "Stock assigned", orderStatus: order.status, module: "Order", entityName: updatedDoc.parentProductName, entityCode: updatedDoc.parentProductCode,
           changeField: "assignedQuantity", oldValue: prevAssignedQty, activityValue: newAssignedQty, newValue: newAssignedQty,
-          description: `Assigned Quantity ${newAssignedQty} of ${updatedDoc.parentProductName}. Stock Before: ${stockBefore}, Stock After: ${actualStockAfter} ,(Unit: ${user?.unitName})`,
+          description: `Assigned Quantity ${newAssignedQty} of ${updatedDoc.parentProductName}. Stock: ${stockBefore} -> ${actualStockAfter} (Unit: ${user?.unitName})`,
           ipAddress: req.ip, userAgent: req.headers["user-agent"]
         });
       }
@@ -1356,29 +1355,29 @@ exports.updateAssignedQuantities = async (req, res) => {
             "stockByUnit.unitId": unitId,
             ...(diff > 0 ? { "stockByUnit.totalMPQuantity": { $gte: diff } } : {})
           },
-          { $inc: { "stockByUnit.$[elem].totalMPQuantity": -diff } },
+          { $inc: { "stockByUnit.$.totalMPQuantity": -diff } },
           { 
             session, 
-            arrayFilters: [{ "elem.unitId": unitId }],
             new: false,
             projection: { stockByUnit: { $elemMatch: { unitId } }, mainParentProductName: 1, mainParentProductCode: 1, parentProducts: 1 } 
           }
         );
 
-        if (!updatedDoc) throw new Error(`Insufficient stock for ${mainParentId} in ${user?.unitName}`);
+        if (!updatedDoc) throw new Error(`Stock mismatch for Main Parent: ${mainParentId}`);
 
         const stockBefore = updatedDoc.stockByUnit[0].totalMPQuantity;
         const actualStockAfter = stockBefore - diff;
 
-        // Sync constituent parent products
+        // Sync constituent parents
         if (updatedDoc.parentProducts?.length > 0) {
           for (const config of updatedDoc.parentProducts) {
             const rQty = diff * config.quantity;
-            await ParentProduct.updateOne(
+            const res = await ParentProduct.updateOne(
               { _id: config.parentProductId, "stockByUnit.unitId": unitId },
-              { $inc: { "stockByUnit.$[elem].availableToCommitPPQuantity": -rQty } },
-              { session, arrayFilters: [{ "elem.unitId": unitId }] }
+              { $inc: { "stockByUnit.$.availableToCommitPPQuantity": -rQty } },
+              { session }
             );
+            if (res.matchedCount === 0) throw new Error(`Constituent parent stock entry missing: ${config.parentProductId}`);
             await recalculateMainParentsForParent(config.parentProductId, unitId, session);
           }
         }
@@ -1389,7 +1388,7 @@ exports.updateAssignedQuantities = async (req, res) => {
           orderId: order._id, orderCode: order.orderCode,
           action: "Stock assigned", module: "Order", entityName: updatedDoc.mainParentProductName, entityCode: updatedDoc.mainParentProductCode,
           changeField: "assignedQuantity", oldValue: prevAssignedQty, activityValue: newAssignedQty, newValue: newAssignedQty,
-          description: `Assigned Quantity ${newAssignedQty} of ${updatedDoc.mainParentProductName}. Stock Before: ${stockBefore}, Stock After: ${actualStockAfter} ,(Unit: ${user?.unitName})`,
+          description: `Assigned Quantity ${newAssignedQty} of ${updatedDoc.mainParentProductName}. Stock: ${stockBefore} -> ${actualStockAfter} (Unit: ${user?.unitName})`,
           ipAddress: req.ip, userAgent: req.headers["user-agent"]
         });
       }
@@ -1401,72 +1400,57 @@ exports.updateAssignedQuantities = async (req, res) => {
     if (updatedCount > 0) {
       await order.save({ session });
       if (logsToCreate.length) await Logs.insertMany(logsToCreate, { session });
+      
       await session.commitTransaction();
 
-      // --- REFRESH DATA FOR RESPONSE ---
+      // --- FINAL DATA REFRESH ---
       order.productDetails.forEach((item) => {
         if (item.productTypeId) allIds.type.add(item.productTypeId.toString());
         if (item.parentProductId) allIds.parent.add(item.parentProductId.toString());
         if (item.mainParentId) allIds.main.add(item.mainParentId.toString());
       });
 
-      const [parentDocs, mainDocs, typeDocs] = await Promise.all([
+      const [pDocs, mDocs, tDocs] = await Promise.all([
         allIds.parent.size ? ParentProduct.find({ _id: { $in: Array.from(allIds.parent) } }).lean() : [],
         allIds.main.size ? MainParentProduct.find({ _id: { $in: Array.from(allIds.main) } }).lean() : [],
         allIds.type.size ? ProductType.find({ _id: { $in: Array.from(allIds.type) } }).lean() : []
       ]);
 
       const maps = {
-        parent: new Map(parentDocs.map(d => [d._id.toString(), d])),
-        main: new Map(mainDocs.map(d => [d._id.toString(), d])),
-        type: new Map(typeDocs.map(d => [d._id.toString(), d]))
+        parent: new Map(pDocs.map(d => [d._id.toString(), d])),
+        main: new Map(mDocs.map(d => [d._id.toString(), d])),
+        type: new Map(tDocs.map(d => [d._id.toString(), d]))
       };
 
       const enrichedDetails = order.productDetails.map((detail) => {
         const type = detail.productTypeId ? maps.type.get(detail.productTypeId.toString()) : null;
         let stockQty = 0;
-        let nameInfo = {};
-
         if (detail.parentProductId) {
           const d = maps.parent.get(detail.parentProductId.toString());
-          if (d) {
-            const stockRecord = d.stockByUnit?.find(s => s.unitId.toString() === unitId.toString());
-            stockQty = stockRecord?.availableToCommitPPQuantity || 0;
-            nameInfo = { parentProductName: d.parentProductName };
-          }
+          stockQty = d?.stockByUnit?.find(s => s.unitId.toString() === unitId.toString())?.availableToCommitPPQuantity || 0;
         } else if (detail.mainParentId) {
           const d = maps.main.get(detail.mainParentId.toString());
-          if (d) {
-            const stockRecord = d.stockByUnit?.find(s => s.unitId.toString() === unitId.toString());
-            stockQty = stockRecord?.totalMPQuantity || 0;
-            nameInfo = { mainParentProductName: d.mainParentProductName };
-          }
+          stockQty = d?.stockByUnit?.find(s => s.unitId.toString() === unitId.toString())?.totalMPQuantity || 0;
         }
-
         return { 
           ...detail.toObject(), 
           productTypeName: type?.productTypeName, 
-          ...nameInfo, 
           availableQuantity: stockQty 
         };
       });
 
       session.endSession();
-      return res.status(200).json({ 
-        message: "Assigned quantities updated successfully.", 
-        updatedProductDetails: enrichedDetails 
-      });
-
+      return res.status(200).json({ message: "Assigned quantities updated successfully.", updatedProductDetails: enrichedDetails });
     } else {
       await session.abortTransaction();
       session.endSession();
-      return res.status(404).json({ message: "No matching product details found to update." });
+      return res.status(404).json({ message: "No updates made." });
     }
 
   } catch (error) {
     if (session.inTransaction()) await session.abortTransaction();
     session.endSession();
-    return res.status(500).json({ success: false, message: error.message || "Internal server error" });
+    return res.status(500).json({ success: false, message: error.message });
   }
 };
 
