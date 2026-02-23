@@ -1341,9 +1341,9 @@ exports.updateAssignedQuantities = async (req, res) => {
           employeeId: user?.employeeId, employeeCode: user?.employeeCode, employeeName: user?.employeeName,
           unitId, unitName: user?.unitName, customerID: order.customerId, parentProductId,
           orderId: order._id, orderCode: order.orderCode, orderType: order.orderType,
-          action: "Stock assigned", module: "Order", entityName: updatedDoc.parentProductName, entityCode: updatedDoc.parentProductCode,
+          action: "Stock assigned",orderStatus: order.status, module: "Order", entityName: updatedDoc.parentProductName, entityCode: updatedDoc.parentProductCode,
           changeField: "assignedQuantity", oldValue: prevAssignedQty, activityValue: newAssignedQty, newValue: newAssignedQty,
-          description: `Changed assignment from ${prevAssignedQty} to ${newAssignedQty} for ${updatedDoc.parentProductName}. Stock: ${stockBefore} -> ${actualStockAfter} (Unit: ${user?.unitName})`,
+          description: `Assigned Quantity ${newAssignedQty} of ${updatedDoc.parentProductName}. Stock Before: ${stockBefore}, Stock After: ${actualStockAfter} ,(Unit: ${user?.unitName})`,
           ipAddress: req.ip, userAgent: req.headers["user-agent"]
         });
       }
@@ -1389,7 +1389,7 @@ exports.updateAssignedQuantities = async (req, res) => {
           orderId: order._id, orderCode: order.orderCode,
           action: "Stock assigned", module: "Order", entityName: updatedDoc.mainParentProductName, entityCode: updatedDoc.mainParentProductCode,
           changeField: "assignedQuantity", oldValue: prevAssignedQty, activityValue: newAssignedQty, newValue: newAssignedQty,
-          description: `Changed assignment from ${prevAssignedQty} to ${newAssignedQty} for ${updatedDoc.mainParentProductName}. Stock: ${stockBefore} -> ${actualStockAfter} (Unit: ${user?.unitName})`,
+          description: `Assigned Quantity ${newAssignedQty} of ${updatedDoc.mainParentProductName}. Stock Before: ${stockBefore}, Stock After: ${actualStockAfter} ,(Unit: ${user?.unitName})`,
           ipAddress: req.ip, userAgent: req.headers["user-agent"]
         });
       }
